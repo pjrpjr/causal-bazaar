@@ -94,10 +94,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_CLI="${SCRIPT_DIR}/cli/bazaar.py"
 SRC_BRIDGE="${SCRIPT_DIR}/bridge/bazaar_edge_hand.py"
+SRC_STDIO_BRIDGE="${SCRIPT_DIR}/integrations/mcp/mcp_stdio_bridge.py"
 SRC_HERMES_SKILL="${SCRIPT_DIR}/integrations/hermes/SKILL.md"
 SRC_UNIVERSAL_SKILL="${SCRIPT_DIR}/SKILL.md"
 
-for req_file in "${SRC_CLI}" "${SRC_BRIDGE}" "${SRC_HERMES_SKILL}" "${SRC_UNIVERSAL_SKILL}"; do
+for req_file in "${SRC_CLI}" "${SRC_BRIDGE}" "${SRC_STDIO_BRIDGE}" "${SRC_HERMES_SKILL}" "${SRC_UNIVERSAL_SKILL}"; do
   if [[ ! -f "${req_file}" ]]; then
     echo "[causal-bazaar install] ERROR: missing bundle file: ${req_file}" >&2
     exit 1
@@ -116,7 +117,7 @@ CODEX_SKILL_DIR="${CODEX_DIR}/skills/causal-bazaar"
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   echo "[causal-bazaar install] DRY RUN (no files modified):"
   echo "  1. Create 0700 keyring dir: ${KEYRING_DIR}"
-  echo "  2. Install CLI & 10s Edge Bridge -> ${KR_BIN_DIR}/{bazaar,bazaar_edge_hand.py}"
+  echo "  2. Install CLI, 10s Edge Bridge & Stdio MCP Bridge -> ${KR_BIN_DIR}/{bazaar,bazaar_edge_hand.py,mcp_stdio_bridge.py}"
   echo "  3. Link executable -> ${BIN_DIR}/bazaar"
   echo "  4. Write 0600 env helper -> ${ENV_SH} (STORE_URL=${STORE_URL})"
   if [[ "${SKIP_HERMES}" -eq 0 ]]; then
@@ -133,7 +134,8 @@ chmod 700 "${KEYRING_DIR}"
 
 cp "${SRC_CLI}" "${KR_BIN_DIR}/bazaar"
 cp "${SRC_BRIDGE}" "${KR_BIN_DIR}/bazaar_edge_hand.py"
-chmod 755 "${KR_BIN_DIR}/bazaar" "${KR_BIN_DIR}/bazaar_edge_hand.py"
+cp "${SRC_STDIO_BRIDGE}" "${KR_BIN_DIR}/mcp_stdio_bridge.py"
+chmod 755 "${KR_BIN_DIR}/bazaar" "${KR_BIN_DIR}/bazaar_edge_hand.py" "${KR_BIN_DIR}/mcp_stdio_bridge.py"
 ln -sf "${KR_BIN_DIR}/bazaar" "${BIN_DIR}/bazaar"
 
 umask 077

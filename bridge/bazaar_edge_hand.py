@@ -47,15 +47,126 @@ MAX_FULFILL_BODY_BYTES = 220 * 1024  # Safely under store_v2 server.py 256 KiB l
 MAX_UPSTREAM_READ_BYTES = 2 * 1024 * 1024
 
 # Outbound secret & credential redaction patterns (compiled once).
-_RE_SK2_TOKEN = re.compile("sk2" + r"_[A-Za-z0-9_-]{20,}")
+_TOK_PREFIX = "sk2" + "_"
+_RE_SK2_TOKEN = re.compile(_TOK_PREFIX + r"[A-Za-z0-9_-]{20,}")
 _RE_SK_TOKEN = re.compile("sk" + r"-[A-Za-z0-9_-]{20,}")
 _RE_GHP_TOKEN = re.compile(r"(?:ghp|gho|ghu|ghs)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}")
 _RE_BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=:-]{8,}")
 _RE_PRIVATE_KEY = re.compile(
     "-----BEGIN [A-Z0-9 ]*PRIV" + r"ATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIV" + "ATE KEY-----"
 )
-_RE_ARGV_RAW_TOKEN = re.compile("^(?:sk2" + r"_[A-Za-z0-9_-]{16,}|sk" + r"-[A-Za-z0-9_-]{20,}|gh" + r"p_[A-Za-z0-9]{20,})$")
+_RE_ARGV_RAW_TOKEN = re.compile("^(?:" + _TOK_PREFIX + r"[A-Za-z0-9_-]{16,}|sk" + r"-[A-Za-z0-9_-]{20,}|gh" + r"p_[A-Za-z0-9]{20,})$")
 _RE_SLUG_CLEAN = re.compile(r"[^A-Za-z0-9._-]+")
+_INVALID_TOKEN_SENTINELS = frozenset(
+    {
+        "",
+        "0",
+        "false",
+        "none",
+        "null",
+        "undefined",
+        "redacted",
+        "[redacted]",
+        "[redacted:key]",
+        "your_api_key",
+        "replace_me",
+        "changeme",
+    }
+)
+
+
+def _normalize_store_token(raw: str | None) -> str:
+    """Normalize a store bearer token and reject unexpanded template/sentinel placeholders."""
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    if not cleaned:
+        return ""
+    if any(ch in cleaned for ch in ("\r", "\n", "\x00")) or any(ch.isspace() for ch in cleaned):
+        return ""
+    lower = cleaned.lower()
+    if lower in _INVALID_TOKEN_SENTINELS or lower.startswith("[redacted"):
+        return ""
+    if (cleaned.startswith("${") and cleaned.endswith("}")) or (cleaned.startswith("<") and cleaned.endswith(">")):
+        return ""
+    if cleaned.startswith("$") and len(cleaned) > 1 and cleaned[1:].replace("_", "").isalnum():
+        return ""
+    if "${" in cleaned:
+        return ""
+    return cleaned
+
+
+def _read_store_key_file(path: Path) -> str:
+    """Read a store bearer token from a plain-text or JSON 0600 key file."""
+    resolved = path.expanduser()
+    if not resolved.is_file():
+        return ""
+    raw = resolved.read_text(encoding="utf-8").strip()
+    if not raw:
+        return ""
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            return ""
+        if isinstance(obj, dict):
+            legacy_field = _TOK_PREFIX + "key"
+            for field_name in ("token", "api_key", "seat_key", "seller_token", "buyer_key", "buyer_token", legacy_field):
+                val = obj.get(field_name)
+                if isinstance(val, str):
+                    norm = _normalize_store_token(val)
+                    if norm:
+                        return norm
+        return ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _normalize_store_token(stripped)
+    return ""
+
+
+def _open_url_with_proxy_fallback(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    ctx: ssl.SSLContext | None = None,
+) -> Any:
+    """Open URL with automatic ProxyHandler({}) fallback on dead local proxy env vars."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as err:
+        reason_txt = str(err).lower()
+        has_proxy = any(
+            os.environ.get(k, "").strip()
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+        ) or bool(urllib.request.getproxies())
+        is_proxy_err = (
+            has_proxy
+            or isinstance(getattr(err, "reason", None), ConnectionRefusedError)
+            or "connection refused" in reason_txt
+            or "tunnel connection failed" in reason_txt
+            or "proxy" in reason_txt
+        )
+        if not is_proxy_err:
+            raise
+        fresh_req = urllib.request.Request(
+            req.full_url,
+            data=req.data,
+            headers=dict(req.header_items()),
+            method=req.get_method(),
+        )
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
+        if ctx is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers)
+        return opener.open(fresh_req, timeout=timeout)
 
 
 class BridgeError(RuntimeError):
@@ -216,6 +327,10 @@ class CardHandSpec:
     is_public: bool = True
     skip_card: bool = False
 
+    def __post_init__(self) -> None:
+        if isinstance(self.price_micros, bool) or not isinstance(self.price_micros, int) or self.price_micros < 0:
+            raise BridgeError(f"price_micros must be a non-negative integer, got {self.price_micros!r}")
+
     @classmethod
     def from_manifest_and_args(
         cls,
@@ -258,6 +373,8 @@ class CardHandSpec:
             title = f"Edge Capability ({raw_card_id})"
 
         price_raw = pick("price_micros", "price_micros", default=0)
+        if isinstance(price_raw, bool):
+            raise BridgeError(f"price_micros must be a non-negative integer, got {price_raw!r}")
         try:
             price_micros = int(price_raw)
         except (TypeError, ValueError) as exc:
@@ -445,7 +562,7 @@ class HttpUpstreamAdapter(EdgeAdapter):
         req = urllib.request.Request(target_url, data=body_bytes, headers=hdrs, method=self.method)
         ctx = self.ssl_context if target_url.startswith("https://") else None
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec, context=ctx) as resp:
+            with _open_url_with_proxy_fallback(req, timeout=self.timeout_sec, ctx=ctx) as resp:
                 status = int(resp.status)
                 ctype = resp.headers.get("Content-Type", "")
                 hdr_paid = resp.headers.get("X-Causal-Paid-Micros") or resp.headers.get("X-Paid-Micros") or ""
@@ -532,10 +649,19 @@ class HttpUpstreamAdapter(EdgeAdapter):
 
 
 def _child_env() -> dict[str, str]:
-    """Build subprocess environment stripping bridge seat credentials."""
+    """Build subprocess environment stripping bridge seat, session, and founder credentials."""
     env = dict(os.environ)
-    env.pop("BAZAAR_API_KEY", None)
-    env.pop("CAUSAL_STORE_API_KEY", None)
+    for var_name in (
+        "BAZAAR_API_KEY",
+        "CAUSAL_STORE_API_KEY",
+        "BAZAAR_SELLER_KEY",
+        "BAZAAR_EDGE_SEAT_KEY",
+        "BAZAAR_FOUNDER_TOKEN",
+        "BAZAAR_ACCOUNT_SESSION_TOKEN",
+        "BAZAAR_REGISTRAR_ADMIN_KEY",
+        "STORE_BOOTSTRAP_KEY",
+    ):
+        env.pop(var_name, None)
     return env
 
 
@@ -1130,7 +1256,7 @@ class StoreV2Client:
         req = urllib.request.Request(url, data=body_bytes, headers=hdrs, method=method)
         ctx = self.ssl_context if url.startswith("https://") else None
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            with _open_url_with_proxy_fallback(req, timeout=timeout, ctx=ctx) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 return int(resp.status), (json.loads(raw) if raw.strip() else {})
         except urllib.error.HTTPError as err:
@@ -1219,6 +1345,23 @@ class StoreV2Client:
 # ============================================================================
 
 
+def _token_supports_hand_ops(
+    store_url: str,
+    token: str,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> bool:
+    """Return True if `token` authenticates via GET /whoami and allows `hand` operations."""
+    client = StoreV2Client(store_url=store_url, token=token, ssl_context=ssl_context)
+    st, data = client.request_json("GET", "/whoami", timeout=6.0)
+    if st != 200 or not isinstance(data, dict) or not data.get("ok"):
+        return False
+    if str(data.get("kind") or "") == "founder":
+        return True
+    allow_ops = data.get("allow_ops")
+    return isinstance(allow_ops, list) and "hand" in allow_ops
+
+
 def resolve_or_onboard_api_key(
     *,
     store_url: str,
@@ -1232,23 +1375,32 @@ def resolve_or_onboard_api_key(
     ssl_context: ssl.SSLContext | None = None,
     log_stream: Any = None,
 ) -> tuple[str, Path | None]:
-    """Resolve store key from env / --key-file / saved seat key, or self-onboard via /bridge/register."""
+    """Resolve store key from explicit CLI/file, seller seat key, env, or self-onboard via /bridge/register."""
     environ = env if env is not None else os.environ
-    env_tok = (environ.get("BAZAAR_API_KEY") or environ.get("CAUSAL_STORE_API_KEY") or "").strip()
-    if env_tok:
-        return env_tok, None
 
-    if argv_token.strip():
-        return argv_token.strip(), None
+    # 1. Explicit CLI --api-key / --token override takes highest precedence when valid.
+    explicit_argv_tok = _normalize_store_token(argv_token)
+    if explicit_argv_tok:
+        return explicit_argv_tok, None
 
+    # 2. Explicit --key-file override takes precedence over ambient env vars.
     if key_file:
         kp = Path(key_file).expanduser()
         if kp.is_file():
-            tok = kp.read_text(encoding="utf-8").strip()
+            tok = _read_store_key_file(kp)
             if tok:
                 return tok, kp
+            if not auto_onboard:
+                raise BridgeError(f"--key-file is empty or invalid: {kp}")
         elif not auto_onboard:
             raise BridgeError(f"--key-file does not exist: {kp}")
+
+    # 3. Explicit seller env vars take precedence over generic buyer BAZAAR_API_KEY.
+    seller_env_tok = _normalize_store_token(
+        environ.get("BAZAAR_SELLER_KEY") or environ.get("BAZAAR_EDGE_SEAT_KEY") or ""
+    )
+    if seller_env_tok:
+        return seller_env_tok, None
 
     home_dir = Path(environ["HOME"]) if environ.get("HOME") else Path.home()
     default_seat_path = Path(
@@ -1257,11 +1409,35 @@ def resolve_or_onboard_api_key(
         or (home_dir / ".causal-store-v2" / "edge_seat_key")
     ).expanduser()
     save_target = Path(key_file).expanduser() if key_file else default_seat_path
+    existing_seat_tok = _read_store_key_file(save_target) if save_target.is_file() else ""
 
-    if save_target.is_file():
-        existing = save_target.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing, save_target
+    # If --seat-key-file was explicitly supplied and exists, honor it directly.
+    if seat_key_file and existing_seat_tok:
+        return existing_seat_tok, save_target
+
+    env_tok = _normalize_store_token(environ.get("BAZAAR_API_KEY") or environ.get("CAUSAL_STORE_API_KEY") or "")
+    if env_tok:
+        if existing_seat_tok and existing_seat_tok != env_tok:
+            # Common Personal-Agent case: env.sh exported buyer_key into BAZAAR_API_KEY while edge_seat_key holds hand ops.
+            if _token_supports_hand_ops(store_url, env_tok, ssl_context=ssl_context):
+                return env_tok, None
+            _log(
+                f"Ambient BAZAAR_API_KEY lacks seller `hand` permission or is stale; falling back to 0600 seat key {save_target}",
+                stream=log_stream,
+            )
+            return existing_seat_tok, save_target
+        if auto_onboard and not existing_seat_tok:
+            if _token_supports_hand_ops(store_url, env_tok, ssl_context=ssl_context):
+                return env_tok, None
+            _log(
+                "Ambient BAZAAR_API_KEY lacks seller `hand` permission; proceeding with --auto-onboard seller seat registration",
+                stream=log_stream,
+            )
+        else:
+            return env_tok, None
+
+    if existing_seat_tok:
+        return existing_seat_tok, save_target
 
     if not auto_onboard:
         raise BridgeError(
@@ -1287,13 +1463,17 @@ def resolve_or_onboard_api_key(
         raise BridgeError(f"Auto-onboard POST {reg_url} failed (HTTP {st}): {data}")
 
     nested = data.get("key") if isinstance(data.get("key"), dict) else {}
-    minted_tok = str(
-        data.get("token")
-        or data.get("sk2" + "_key")
-        or data.get("api_key")
-        or nested.get("token")
-        or ""
-    ).strip()
+    legacy_key_field = _TOK_PREFIX + "key"
+    minted_tok = _normalize_store_token(
+        str(
+            data.get("seat_key")
+            or data.get("token")
+            or data.get(legacy_key_field)
+            or data.get("api_key")
+            or nested.get("token")
+            or ""
+        )
+    )
     if not minted_tok:
         raise BridgeError(f"Auto-onboard response from {reg_url} did not contain a token: {data}")
 
@@ -1497,6 +1677,10 @@ class EdgeHandBridge:
         self._signals_installed = True
 
     def _restore_signal_handlers(self) -> None:
+        try:
+            atexit.unregister(self.mark_away_once)
+        except Exception:
+            pass
         if not self._signals_installed:
             return
         try:
@@ -1622,9 +1806,16 @@ class EdgeHandBridge:
             while len(self._fulfilled_cache) > 512:
                 self._fulfilled_cache.popitem(last=False)
 
-        fst, fres = self.client.request_json("POST", "/hand/fulfill", payload=fulfill_body, timeout=12.0)
-        if fst != 200 or not fres.get("ok"):
-            _log(f"POST /hand/fulfill for {run_id} returned HTTP {fst}: {fres}", stream=self.log_stream)
+        fst = 0
+        fres: dict[str, Any] = {"ok": False}
+        for attempt in range(3):
+            fst, fres = self.client.request_json("POST", "/hand/fulfill", payload=fulfill_body, timeout=12.0)
+            if fst == 200 and fres.get("ok"):
+                break
+            if fst not in (0, 502, 503, 504) or self._stop_event.is_set() or attempt == 2:
+                _log(f"POST /hand/fulfill for {run_id} returned HTTP {fst}: {fres}", stream=self.log_stream)
+                break
+            time.sleep(0.15 * (attempt + 1))
         return fres
 
     def poll_and_process_once(self) -> int:

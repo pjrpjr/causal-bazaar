@@ -129,6 +129,48 @@ def _write_env_sh_0600(kr_dir: Path, store_url: str, bearer_env_var: str = DEFAU
     return _write_atomic_0600(env_sh_path, env_text)
 
 
+_INVALID_TOKEN_SENTINELS = frozenset(
+    {
+        "",
+        "0",
+        "false",
+        "none",
+        "null",
+        "undefined",
+        "redacted",
+        "[redacted]",
+        "[redacted:key]",
+        "your_api_key",
+        "replace_me",
+        "changeme",
+    }
+)
+
+
+def _normalize_token(raw: str | None) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    if not cleaned:
+        return ""
+    if any(ch in cleaned for ch in ("\r", "\n", "\x00")) or any(ch.isspace() for ch in cleaned):
+        return ""
+    lower = cleaned.lower()
+    if lower in _INVALID_TOKEN_SENTINELS or lower.startswith("[redacted"):
+        return ""
+    if (cleaned.startswith("${") and cleaned.endswith("}")) or (cleaned.startswith("<") and cleaned.endswith(">")):
+        return ""
+    if cleaned.startswith("$") and len(cleaned) > 1 and cleaned[1:].replace("_", "").isalnum():
+        return ""
+    if "${" in cleaned:
+        return ""
+    return cleaned
+
+
 def _read_key_file(path: Path) -> str:
     if not path.is_file():
         return ""
@@ -144,10 +186,17 @@ def _read_key_file(path: Path) -> str:
             legacy_field = "sk2" + "_key"
             for k in ("token", "api_key", "buyer_key", "buyer_token", "seat_key", "seller_token", legacy_field):
                 v = obj.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
+                if isinstance(v, str):
+                    norm = _normalize_token(v)
+                    if norm:
+                        return norm
         return ""
-    return raw.splitlines()[0].strip()
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _normalize_token(stripped)
+    return ""
 
 
 def _keyring_dir(args: argparse.Namespace) -> Path:
@@ -184,27 +233,38 @@ def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False
         return tok, all_known
 
     env_tok = (
-        os.environ.get(DEFAULT_BEARER_ENV_VAR, "").strip()
-        or os.environ.get("BAZAAR_API_KEY", "").strip()
-        or os.environ.get("CAUSAL_STORE_API_KEY", "").strip()
+        _normalize_token(os.environ.get(DEFAULT_BEARER_ENV_VAR, ""))
+        or _normalize_token(os.environ.get("BAZAAR_API_KEY", ""))
+        or _normalize_token(os.environ.get("CAUSAL_STORE_API_KEY", ""))
     )
-    if env_tok:
-        all_known.append(env_tok)
+    seller_env_tok = (
+        _normalize_token(os.environ.get("BAZAAR_SELLER_KEY", ""))
+        or _normalize_token(os.environ.get("BAZAAR_EDGE_SEAT_KEY", ""))
+    )
+    for extra_t in (env_tok, seller_env_tok):
+        if extra_t and extra_t not in all_known:
+            all_known.append(extra_t)
+
+    buyer_tok = _read_key_file(buyer_file)
+    seat_tok = _read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")
 
     if prefer_seller_seat:
-        seat_tok = _read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")
-        if seat_tok:
-            return seat_tok, all_known
-        if env_tok:
-            return env_tok, all_known
-        return _read_key_file(buyer_file), all_known
+        for cand in (seller_env_tok, seat_tok, env_tok, buyer_tok):
+            if cand:
+                return cand, all_known
+        return "", all_known
 
-    if env_tok:
-        return env_tok, all_known
-    buyer_tok = _read_key_file(buyer_file)
-    if buyer_tok:
-        return buyer_tok, all_known
-    return (_read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")), all_known
+    if env_tok and not env_tok.startswith(_TOK_PREFIX_A) and (
+        buyer_tok.startswith(_TOK_PREFIX_A) or seat_tok.startswith(_TOK_PREFIX_A)
+    ):
+        for cand in (buyer_tok, seat_tok, env_tok, seller_env_tok):
+            if cand:
+                return cand, all_known
+
+    for cand in (env_tok, buyer_tok, seat_tok, seller_env_tok):
+        if cand:
+            return cand, all_known
+    return "", all_known
 
 
 def _open_url_with_proxy_fallback(
@@ -988,6 +1048,25 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     need_seller_seat = (price_micros > 0) or bool(hand_id)
 
     tok, scrub = _resolve_token(args, prefer_seller_seat=need_seller_seat)
+    alt_tok, alt_scrub = _resolve_token(args, prefer_seller_seat=(not need_seller_seat))
+    for s in alt_scrub:
+        if s not in scrub:
+            scrub.append(s)
+    fallback_pub_tokens: list[str] = []
+    if getattr(args, "key_file", None):
+        if tok:
+            fallback_pub_tokens.append(tok)
+    else:
+        kr_dir_pub = _keyring_dir(args)
+        for cand_t in (
+            tok,
+            _read_key_file(kr_dir_pub / "edge_seat_key") if need_seller_seat else _read_key_file(kr_dir_pub / "buyer_key"),
+            alt_tok,
+            _read_key_file(kr_dir_pub / "buyer_key"),
+            _read_key_file(kr_dir_pub / "edge_seat_key"),
+        ):
+            if cand_t and cand_t not in fallback_pub_tokens:
+                fallback_pub_tokens.append(cand_t)
     if not tok:
         return _emit(
             {"ok": False, "error": "No API key found in keyring; run `bazaar login` first"},
@@ -1064,12 +1143,24 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     if args.trace_id:
         tool_args["trace_id"] = args.trace_id
 
-    code, is_err, data = _call_mcp_tool(north, "bazaar_publish_card", tool_args, token=tok)
+    code, is_err, data = 0, True, {"ok": False}
+    for cand_tok in (fallback_pub_tokens or [tok]):
+        code, is_err, data = _call_mcp_tool(north, "bazaar_publish_card", tool_args, token=cand_tok)
+        if code == 404:
+            break
+        err_code = str((data or {}).get("code") or "").lower()
+        err_http = int((data or {}).get("http_status") or 0) if isinstance((data or {}).get("http_status"), int) else 0
+        if not is_err or (code not in (401, 403) and err_http not in (401, 403) and err_code not in ("unauthorized", "forbidden")):
+            break
     if code == 404:
         card_body = dict(tool_args)
         card_body["is_dead_end"] = 1 if bool(args.dead_end) else 0
         card_body["is_public"] = is_public
-        r_code, r_data = _http_json("POST", f"{south}/card", token=tok, body=card_body)
+        r_code, r_data = 0, {"ok": False}
+        for cand_tok in (fallback_pub_tokens or [tok]):
+            r_code, r_data = _http_json("POST", f"{south}/card", token=cand_tok, body=card_body)
+            if r_code not in (401, 403):
+                break
         ok = r_code == 200 and isinstance(r_data, dict) and bool(r_data.get("ok"))
         return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=(0 if ok else 1))
 
@@ -1209,7 +1300,12 @@ def _cmd_toggle(args: argparse.Namespace) -> int:
         card_obj: dict[str, Any] | None = None
         chosen_tok = dedup_tokens[0]
         for cand_tok in dedup_tokens:
-            g_code, g_data = _http_json("GET", f"{south}/card/{urllib.parse.quote(cid, safe='')}", token=cand_tok)
+            g_code = 404
+            g_data: Any = {}
+            for base_url in ([south] if south == north else [south, north]):
+                g_code, g_data = _http_json("GET", f"{base_url}/card/{urllib.parse.quote(cid, safe='')}", token=cand_tok)
+                if g_code == 200 and isinstance(g_data, dict) and isinstance(g_data.get("card"), dict):
+                    break
             if g_code == 200 and isinstance(g_data, dict) and isinstance(g_data.get("card"), dict):
                 w_code, w_data = _http_json("GET", f"{south}/whoami", token=cand_tok)
                 card_candidate = g_data["card"]
@@ -1347,13 +1443,26 @@ def _cmd_mount(args: argparse.Namespace) -> int:
         child_env.pop("BAZAAR_API_KEY", None)
         child_env.pop("CAUSAL_STORE_API_KEY", None)
         cmd_argv.extend(["--key-file", str(Path(explicit_key_file).expanduser())])
-    elif seat_file.is_file() or args.auto_onboard or not buyer_file.is_file():
+    elif seat_file.is_file():
         child_env.pop("BAZAAR_API_KEY", None)
         child_env.pop("CAUSAL_STORE_API_KEY", None)
         cmd_argv.extend(["--seat-key-file", str(seat_file)])
-        if not seat_file.is_file() or args.auto_onboard:
+        if args.auto_onboard:
             cmd_argv.extend(["--auto-onboard", "--onboarding-url", f"{north}/bridge/register"])
-    elif buyer_file.is_file() and not child_env.get("BAZAAR_API_KEY"):
+    elif args.auto_onboard or (price == 0 and not buyer_file.is_file()):
+        child_env.pop("BAZAAR_API_KEY", None)
+        child_env.pop("CAUSAL_STORE_API_KEY", None)
+        cmd_argv.extend(
+            [
+                "--seat-key-file",
+                str(seat_file),
+                "--auto-onboard",
+                "--onboarding-url",
+                f"{north}/bridge/register",
+            ]
+        )
+    elif buyer_file.is_file() and not _normalize_token(child_env.get("BAZAAR_API_KEY", "")):
+        child_env.pop("BAZAAR_API_KEY", None)
         cmd_argv.extend(["--key-file", str(buyer_file)])
 
     if args.owner_label:
