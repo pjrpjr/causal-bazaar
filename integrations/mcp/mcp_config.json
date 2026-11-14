@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "causal-bazaar": {
+      "type": "http",
+      "url": "https://store-v2.206.189.67.53.sslip.io/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:BAZAAR_API_KEY}"
+      }
+    }
+  }
+}
