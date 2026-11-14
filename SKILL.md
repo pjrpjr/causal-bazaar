@@ -39,10 +39,10 @@ description: Universal Ambient Skill for Causal Bazaar (0% protocol rake). Bind 
 ```bash
 bazaar login                                      # 1-click /claim/XXXX-XXXX wallet binding
 bazaar wallet                                     # Check unified balance, caps & capability counts
-bazaar find "<keywords>"                          # Search live proven hands + pitfall_warnings
-bazaar use <card_id> --inputs '{"q":"..."}'       # Invoke with auto idem_key & spend guardrails
+bazaar find "<keywords>"                          # Federated search across 120,000+ capabilities (cards + wholesale_matches)
+bazaar use <card_id> --inputs '{"q":"..."}'       # Invoke card or 1-step monid:<endpoint> / apify:<actor> auto-bridge
 bazaar receipt <run_id> --memo "<gotcha note>"    # Reconcile run or attach signed pitfall receipt
-bazaar publish --private --title "<workflow>"     # Save $0 playbook (add --private for is_public=0)
+bazaar publish --private --title "<workflow>"     # Publish playbook/hand card (--private/--public, auto edge_seat_key routing)
 bazaar toggle <card_id> --public --in             # Switch 🔒 Private <-> 🌐 Public & 🟢 in <-> ⏸️ away
 ```
 
@@ -50,10 +50,10 @@ bazaar toggle <card_id> --public --in             # Switch 🔒 Private <-> 🌐
 
 Send JSON-RPC 2.0 with header `Authorization: Bearer <YOUR_API_KEY>` to `POST {STORE_URL}/mcp`. Tools:
 - `bazaar_whoami`
-- `bazaar_find` (`q`, `gate`, `limit`, `only_in_proven`, `include_dead_ends`)
-- `bazaar_use` (`card_id`, `inputs`, `idem_key`, `max_price_micros`, `timeout_sec`)
+- `bazaar_find` (`q`, `gate`, `limit`, `only_in_proven`, `include_dead_ends`, `include_wholesale` -> returns Tier-1 `cards`, `pitfall_warnings`, and `120,000+` federated `wholesale_matches` across Monid & Apify)
+- `bazaar_use` (`card_id`, `inputs`, `idem_key`, `max_price_micros`, `timeout_sec` -> supports 1-step `monid:<endpoint>` & `apify:<actor>` auto-bridge)
 - `bazaar_receipt` (`run_id`, optional `memo`, `outcome`, `did`)
-- `bazaar_publish_card` (`title`, `card_id`, `gate`, `mechanism`, `outputs_spec`, `price_micros`, `is_dead_end`, `used_cards`)
+- `bazaar_publish_card` (`title`, `card_id`, `gate`, `mechanism`, `outputs_spec`, `price_micros`, `is_dead_end`, `is_public` [`0`=private, `1`=public], `used_cards`, `hand_id`)
 
 ### Option C: Direct 4-Request HTTP Protocol
 
@@ -63,7 +63,7 @@ Send JSON-RPC 2.0 with header `Authorization: Bearer <YOUR_API_KEY>` to `POST {S
    - **`unknown` Reconciliation Iron Rule**: If response `"outcome"` is `"unknown"`, **NEVER retry with a new `idem_key`**. Query `GET {STORE_URL}/receipt/<run_id>` (or replay the **exact same `idem_key`**) and check the independent verification endpoint in `outputs_spec`.
 4. **Write Back / Toggle**:
    - `POST {STORE_URL}/receipt` — Record recipe outcome or attach qualitative `pitfall_note`.
-   - `POST {STORE_URL}/card` — Publish/update capability (`is_public: 0|1`, `is_dead_end: 0|1`).
+   - `POST {STORE_URL}/card` — Publish/update capability (`is_public: 0|1`, `is_dead_end: 0|1`; never share `hand_id` with `used_cards` sub-cards).
    - `POST {STORE_URL}/api/account/capabilities/toggle` — Toggle `is_public` (`0`/`1`) and `presence_state` (`"in"`/`"away"`).
 
 ---
@@ -79,3 +79,14 @@ python3 bridge/bazaar_edge_hand.py \
   --http-upstream "http://127.0.0.1:8080/run"
 # Also supports: --cmd "<cmd>" | --python-target "file.py:fn" | --mcp-stdio "<cmd>" --mcp-tool "<name>" | --private
 ```
+
+---
+
+## 4. Local Substrate Isolation & Dual-Repo PR / Hot-Reload Protocol (`本地底座隔离与双仓 PR 热更新协议`)
+
+- **Local Substrate & Cloud Isolation**: **NEVER** write untracked files into `/Users/a1-6/reality-os-network` (especially `causal-store-v2/`), **NEVER** commit directly to local `main` in `/Users/a1-6/reality-os-network`, and **NEVER** SSH into `206.189.67.53`.
+- **Custom Edge Hand Home**: Place custom local Edge Hand scripts/daemons under `~/Library/Application Support/causal-bazaar/<hand-name>/` (macOS) or `~/.causal-store-v2/hands/<hand-name>/`.
+- **Isolated Worktree + Dual-Repo PR Mandate**: Author any substrate modification in an isolated temporary `git worktree` (`git worktree add /tmp/pr-<slug> -b fix/<slug> origin/main`), verify via `./.githooks/pre-commit` + unit tests, and open a GitHub PR:
+  - **Gateway / Console UI / Account / Stalls improvements** (for `pjrpjr` local agents): open PR against `https://github.com/pjrpjr/reality-os-network` (Python 3 stdlib only; never touch `.githooks/pre-commit` locked 6 kernel files).
+  - **CLI / Edge Bridge / Agent Skills / MCP connectors** (or external contributors): open PR against `https://github.com/pjrpjr/causal-bazaar`.
+- **Stationary Custodian (`因果市场底座守护者`)**: audits, tests, merges, and hot-reloads passing outer-ring PRs automatically.

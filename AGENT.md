@@ -31,16 +31,30 @@ Unlike closed API aggregators where only the platform operator can add endpoints
 
 ---
 
-## Path 2: Contributing Connectors & Bridges via Pull Request
+## Path 2: Local Substrate Isolation & Dual-Repo PR / Hot-Reload Protocol (`本地底座隔离与双仓 PR 热更新协议`)
 
-When opening a PR to this repository, follow these strict engineering invariants:
+Causal Bazaar enforces strict working-tree isolation between custom Edge Hands, OSS connectors, and the live gateway/console/stalls substrate:
+
+1. **Local Substrate & Cloud Isolation Rule**:
+   - Local agents/conversations MUST **NEVER** write untracked files into `/Users/a1-6/reality-os-network` (especially `causal-store-v2/`), **NEVER** commit directly to local `main` in `/Users/a1-6/reality-os-network`, and **NEVER** SSH directly into `206.189.67.53`.
+   - Store all custom local Edge Hand scripts and daemons under `~/Library/Application Support/causal-bazaar/<hand-name>/` (macOS) or `~/.causal-store-v2/hands/<hand-name>/`.
+2. **Isolated Temporary Worktree + Dual-Repo PR Workflow**:
+   - Author any substrate or connector modification in an isolated temporary `git worktree` (`git worktree add /tmp/pr-<slug> -b fix/<slug> origin/main`), verify via `./.githooks/pre-commit` + unit tests, and open a GitHub PR:
+   - **CLI / Edge Bridge / Agent Skills / MCP Connectors** (external contributors & personal agents): open a PR against [`https://github.com/pjrpjr/causal-bazaar`](https://github.com/pjrpjr/causal-bazaar).
+   - **Gateway / Console UI / Account / Stalls Improvements** (for `pjrpjr` local agents): open a PR against [`https://github.com/pjrpjr/reality-os-network`](https://github.com/pjrpjr/reality-os-network). **NEVER** touch any of the 6 files locked by `.githooks/pre-commit` (`causal-store-v2/store_v2/{schema.sql,vault.py,kernel.py,server.py}`, `causal-store-v2/scripts/run_bazaar_agent.sh`, `.githooks/pre-commit`).
+3. **Stationary Custodian (`因果市场底座守护者`) Automated Audit & Hot-Reload**:
+   - The Stationary Custodian (`因果市场底座守护者`) continuously audits incoming outer-ring PRs across both repositories, runs full unit & hygiene test suites, merges passing PRs, and hot-reloads outer-ring services automatically.
+
+### Engineering Invariants for Every PR
 
 1. **Zero Third-Party Python Dependencies**: All Python scripts in `cli/` and `bridge/` MUST use **Python 3.12+ standard library modules only** (`urllib.request`, `json`, `ssl`, `subprocess`, `argparse`, `tempfile`, etc.). No `pip install` requirements.
 2. **Zero Secret Leaks**:
-   - Never hardcode, log, or commit any live or test API keys, session cookies, webhook secrets, private keys, or personal emails/phone numbers.
+   - Never hardcode, log, or commit any live or test API keys, session cookies, webhook secrets, cryptographic signing material, or personal emails/phone numbers.
    - Always store local credentials in `0600` files inside `~/.causal-store-v2/` using atomic temp-file replacement (`tempfile.mkstemp` + `0o600` + `os.replace`).
    - Scrub accidental tokens from `sys.argv` and redact outbound outputs before printing or fulfilling runs.
-3. **Ambient Human UX**: Integrations for personal agents (`integrations/hermes/`, `integrations/claude-cursor/`, `integrations/mcp/`) must preserve **Ambient Zero-Jargon Mode** — never force human users to read internal ledger field names or manually edit 10-field JSON forms.
+3. **Ambient Human UX & Pre-Flight Guardrails**:
+   - Integrations (`integrations/hermes/`, `integrations/claude-cursor/`, `integrations/mcp/`) must preserve **Ambient Zero-Jargon Mode**, dead-proxy `ProxyHandler({})` fallback, and automatic `edge_seat_key` routing when `price_micros > 0` or `hand_id` is set.
+   - Never publish single-tap/swipe UI micro-steps or composite cards sharing `hand_id` with their `used_cards` dependencies.
 4. **Verify Before Submitting**:
    ```bash
    python3 -m py_compile cli/bazaar.py bridge/bazaar_edge_hand.py

@@ -157,13 +157,22 @@ def _keyring_dir(args: argparse.Namespace) -> Path:
 def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False) -> tuple[str, list[str]]:
     kr_dir = _keyring_dir(args)
     buyer_file = kr_dir / "buyer_key"
-    seat_file = kr_dir / "edge_seat_key"
+    explicit_kr = bool(getattr(args, "keyring_dir", None))
+    env_seller_file = (
+        ""
+        if explicit_kr
+        else (
+            os.environ.get("BAZAAR_SELLER_KEY_FILE", "").strip()
+            or os.environ.get("BAZAAR_EDGE_SEAT_KEY_FILE", "").strip()
+        )
+    )
+    seat_file = Path(env_seller_file).expanduser() if env_seller_file else (kr_dir / "edge_seat_key")
     explicit_file = getattr(args, "key_file", None)
 
     all_known: list[str] = []
-    for p in (buyer_file, seat_file):
+    for p in (buyer_file, seat_file, kr_dir / "edge_seat_key"):
         t = _read_key_file(p)
-        if t:
+        if t and t not in all_known:
             all_known.append(t)
 
     if explicit_file:
@@ -183,7 +192,7 @@ def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False
         all_known.append(env_tok)
 
     if prefer_seller_seat:
-        seat_tok = _read_key_file(seat_file)
+        seat_tok = _read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")
         if seat_tok:
             return seat_tok, all_known
         if env_tok:
@@ -195,7 +204,45 @@ def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False
     buyer_tok = _read_key_file(buyer_file)
     if buyer_tok:
         return buyer_tok, all_known
-    return _read_key_file(seat_file), all_known
+    return (_read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")), all_known
+
+
+def _open_url_with_proxy_fallback(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    ctx: ssl.SSLContext | None = None,
+) -> Any:
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as err:
+        reason_txt = str(err).lower()
+        has_proxy = any(
+            os.environ.get(k, "").strip()
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+        ) or bool(urllib.request.getproxies())
+        is_proxy_err = (
+            has_proxy
+            or isinstance(getattr(err, "reason", None), ConnectionRefusedError)
+            or "connection refused" in reason_txt
+            or "tunnel connection failed" in reason_txt
+            or "proxy" in reason_txt
+        )
+        if not is_proxy_err:
+            raise
+        fresh_req = urllib.request.Request(
+            req.full_url,
+            data=req.data,
+            headers=dict(req.header_items()),
+            method=req.get_method(),
+        )
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
+        if ctx is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers)
+        return opener.open(fresh_req, timeout=timeout)
 
 
 def _http_json(
@@ -219,7 +266,7 @@ def _http_json(
     req = urllib.request.Request(url, data=raw_req, headers=hdrs, method=method)
     ctx = ssl.create_default_context() if url.startswith("https://") else None
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with _open_url_with_proxy_fallback(req, timeout=timeout, ctx=ctx) as resp:
             txt = resp.read().decode("utf-8", errors="replace")
             return int(resp.status), (json.loads(txt) if txt.strip() else {})
     except urllib.error.HTTPError as err:
@@ -934,7 +981,13 @@ def _cmd_receipt(args: argparse.Namespace) -> int:
 
 def _cmd_publish(args: argparse.Namespace) -> int:
     north, south = _store_urls(args)
-    tok, scrub = _resolve_token(args)
+    price_micros = int(getattr(args, "price_micros", 0) or 0)
+    if price_micros < 0:
+        return _emit({"ok": False, "error": "--price-micros must be >= 0"}, secrets_to_scrub=[], exit_code=2)
+    hand_id = str(getattr(args, "hand_id", "") or "").strip()
+    need_seller_seat = (price_micros > 0) or bool(hand_id)
+
+    tok, scrub = _resolve_token(args, prefer_seller_seat=need_seller_seat)
     if not tok:
         return _emit(
             {"ok": False, "error": "No API key found in keyring; run `bazaar login` first"},
@@ -972,20 +1025,31 @@ def _cmd_publish(args: argparse.Namespace) -> int:
         side_effects = f"Gotchas: {args.pitfalls.strip()}"
 
     is_private = bool(getattr(args, "private", False))
+    is_public = 0 if is_private else 1
+    used_cards: list[str] = []
+    for raw_u in list(getattr(args, "used_cards", None) or []) + list(getattr(args, "used_card", None) or []):
+        for part in str(raw_u).split(","):
+            u = part.strip()
+            if u and u not in used_cards:
+                used_cards.append(u)
+
     tool_args: dict[str, Any] = {
         "title": title,
         "gate": (args.gate or "06 踩过坑才知道的").strip(),
-        "price_micros": int(args.price_micros or 0),
+        "price_micros": price_micros,
         "is_dead_end": bool(args.dead_end),
+        "is_public": is_public,
         "mechanism": mechanism,
     }
     if args.card_id:
         tool_args["card_id"] = args.card_id.strip()
+    if hand_id:
+        tool_args["hand_id"] = hand_id
     if args.inputs_spec:
         tool_args["inputs_spec"] = args.inputs_spec
     if args.outputs_spec:
         tool_args["outputs_spec"] = args.outputs_spec
-    else:
+    elif not hand_id and price_micros == 0:
         tool_args["outputs_spec"] = (
             "Dead-end warning (`is_dead_end=1`); do not execute."
             if args.dead_end
@@ -995,24 +1059,16 @@ def _cmd_publish(args: argparse.Namespace) -> int:
         tool_args["preconditions"] = args.preconditions
     if side_effects:
         tool_args["side_effects"] = side_effects
-    if args.used_card:
-        tool_args["used_cards"] = list(args.used_card)
+    if used_cards:
+        tool_args["used_cards"] = used_cards
     if args.trace_id:
         tool_args["trace_id"] = args.trace_id
-
-    if is_private or int(args.price_micros or 0) > 0:
-        card_body = dict(tool_args)
-        card_body["is_dead_end"] = 1 if bool(args.dead_end) else 0
-        card_body["is_public"] = 0 if is_private else 1
-        r_code, r_data = _http_json("POST", f"{south}/card", token=tok, body=card_body)
-        ok = r_code == 200 and isinstance(r_data, dict) and bool(r_data.get("ok"))
-        return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=(0 if ok else 1))
 
     code, is_err, data = _call_mcp_tool(north, "bazaar_publish_card", tool_args, token=tok)
     if code == 404:
         card_body = dict(tool_args)
         card_body["is_dead_end"] = 1 if bool(args.dead_end) else 0
-        card_body["is_public"] = 1
+        card_body["is_public"] = is_public
         r_code, r_data = _http_json("POST", f"{south}/card", token=tok, body=card_body)
         ok = r_code == 200 and isinstance(r_data, dict) and bool(r_data.get("ok"))
         return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=(0 if ok else 1))
@@ -1291,7 +1347,7 @@ def _cmd_mount(args: argparse.Namespace) -> int:
         child_env.pop("BAZAAR_API_KEY", None)
         child_env.pop("CAUSAL_STORE_API_KEY", None)
         cmd_argv.extend(["--key-file", str(Path(explicit_key_file).expanduser())])
-    elif (seat_file.is_file() or args.auto_onboard or not buyer_file.is_file()) and price == 0:
+    elif seat_file.is_file() or args.auto_onboard or not buyer_file.is_file():
         child_env.pop("BAZAAR_API_KEY", None)
         child_env.pop("CAUSAL_STORE_API_KEY", None)
         cmd_argv.extend(["--seat-key-file", str(seat_file)])
@@ -1423,12 +1479,13 @@ def build_parser() -> argparse.ArgumentParser:
         "publish",
         aliases=["publish-recipe", "publish-playbook", "publish-card"],
         parents=[common],
-        help="Publish a $0 proven playbook or verified dead-end warning (supports --private)",
+        help="Publish a $0 proven playbook, pitfall warning, or hand card (supports --private / --public)",
     )
     p_pub.add_argument("--title", required=True, help="Outcome-level playbook or capability title")
     p_pub.add_argument("--card-id", default="", help="Optional stable card_id slug")
     p_pub.add_argument("--gate", default="06 踩过坑才知道的", help="Gate category")
-    p_pub.add_argument("--price-micros", type=int, default=0, help="Price in micro-USD (default: 0)")
+    p_pub.add_argument("--price-micros", type=int, default=0, help="Price in micro-USD (default: 0; >0 uses edge_seat_key)")
+    p_pub.add_argument("--hand-id", default="", help="Bound hand_id (automatically selects edge_seat_key)")
     p_pub.add_argument("--mechanism", default="", help="End-to-end proven workflow steps")
     p_pub.add_argument("--pitfalls", "--gotchas", dest="pitfalls", default="", help="Exact gotchas & failure boundaries")
     p_pub.add_argument("--inputs-spec", default="", help="Inputs description")
@@ -1439,6 +1496,13 @@ def build_parser() -> argparse.ArgumentParser:
     pub_vis = p_pub.add_mutually_exclusive_group()
     pub_vis.add_argument("--private", action="store_true", help="Save as 🔒 Private capability (is_public=0)")
     pub_vis.add_argument("--public", action="store_true", help="Publish as 🌐 Public capability (is_public=1)")
+    p_pub.add_argument(
+        "--used-cards",
+        nargs="+",
+        action="extend",
+        default=[],
+        help="Upstream card_id(s) composed in a real run (space- or comma-separated)",
+    )
     p_pub.add_argument("--used-card", action="append", default=[], help="Upstream card_id composed in a real run")
     p_pub.add_argument("--trace-id", default="", help="Optional trace ID")
     p_pub.add_argument("--allow-atomic-step", action="store_true", help=argparse.SUPPRESS)
