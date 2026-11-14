@@ -555,70 +555,246 @@ def _cmd_whoami(args: argparse.Namespace) -> int:
     return _emit(data, secrets_to_scrub=scrub, exit_code=(1 if is_err else 0))
 
 
+def _compact_wholesale_item(it: dict[str, Any]) -> dict[str, Any]:
+    raw_cat_id = str(it.get("catalog_id") or "")
+    src = str(it.get("source") or ("apify" if raw_cat_id.startswith("apify:") else "monid"))
+    ep_id = str(it.get("endpoint_id") or (raw_cat_id.split(":", 1)[1] if ":" in raw_cat_id else ""))
+    cat_id = raw_cat_id or (f"{src}:{ep_id}" if ep_id else "")
+    bridge_cid = str(
+        it.get("bridge_card_id")
+        or ("apify_actor_universal_bridge" if src == "apify" else "monid_wholesale_tool_bridge")
+    )
+    default_inputs = (
+        {"action": "run", "endpoint": ep_id, "input": {}}
+        if src == "monid"
+        else {"action": "run", "actor_id": ep_id, "input": {}}
+    )
+    ex = it.get("run_payload_example")
+    return {
+        "catalog_id": cat_id,
+        "source": src,
+        "endpoint_id": ep_id,
+        "title": str(it.get("title") or ep_id),
+        "description": str(it.get("description") or "")[:240],
+        "category": str(it.get("category") or ""),
+        "price_display": str(it.get("price_display") or ""),
+        "price_micros_est": int(it.get("price_micros_est") or 0),
+        "bridge_card_id": bridge_cid,
+        "use_card_id": cat_id,
+        "bridge_inputs": ex if isinstance(ex, dict) and ex else default_inputs,
+    }
+
+
+def _resolve_wholesale_bridge(
+    raw_cid: Any,
+    raw_inputs: dict[str, Any],
+) -> tuple[str | None, dict[str, Any], str | None]:
+    if not isinstance(raw_cid, str):
+        return None, raw_inputs, None
+    s = raw_cid.strip()
+    if s.startswith("monid:"):
+        ep = s[6:].strip()
+        if not ep or len(ep) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in ep) or ".." in ep:
+            raise ValueError("invalid monid endpoint")
+        cid = "monid_wholesale_tool_bridge"
+        if raw_inputs.get("action") and raw_inputs.get("endpoint"):
+            wrapped = dict(raw_inputs)
+        elif raw_inputs.get("action") in ("search", "check_run"):
+            wrapped = {**raw_inputs, "endpoint": ep}
+        else:
+            max_usd = float(raw_inputs.get("max_upstream_usd", 0.05))
+            if (
+                raw_inputs.get("action") == "run"
+                and isinstance(raw_inputs.get("input"), dict)
+                and set(raw_inputs.keys()) <= {"action", "input", "max_upstream_usd"}
+            ):
+                wrapped = {"action": "run", "endpoint": ep, "input": raw_inputs["input"], "max_upstream_usd": max_usd}
+            else:
+                wrapped = {"action": "run", "endpoint": ep, "input": raw_inputs, "max_upstream_usd": max_usd}
+        return cid, wrapped, f"monid:{ep}"
+
+    if s.startswith("apify:"):
+        actor_id = s[6:].strip()
+        if not actor_id or len(actor_id) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in actor_id) or ".." in actor_id:
+            raise ValueError("invalid apify actor_id")
+        cid = "apify_actor_universal_bridge"
+        if raw_inputs.get("action") and raw_inputs.get("actor_id"):
+            wrapped = dict(raw_inputs)
+        elif raw_inputs.get("action") == "inspect":
+            wrapped = {**raw_inputs, "action": "inspect", "actor_id": actor_id}
+        else:
+            max_usd = float(raw_inputs.get("max_upstream_usd", 0.05))
+            if (
+                raw_inputs.get("action") == "run"
+                and isinstance(raw_inputs.get("input"), dict)
+                and set(raw_inputs.keys()) <= {"action", "input", "max_upstream_usd"}
+            ):
+                wrapped = {"action": "run", "actor_id": actor_id, "input": raw_inputs["input"], "max_upstream_usd": max_usd}
+            else:
+                wrapped = {"action": "run", "actor_id": actor_id, "input": raw_inputs, "max_upstream_usd": max_usd}
+        return cid, wrapped, f"apify:{actor_id}"
+
+    return None, raw_inputs, None
+
+
+def _fetch_wholesale_catalog(
+    north: str,
+    south: str,
+    *,
+    q: str,
+    limit: int,
+    source: str = "",
+    token: str = "",
+) -> tuple[dict[str, int], list[dict[str, Any]], dict[str, Any] | None]:
+    eff_limit = max(1, min(int(limit), 50))
+    qs_dict: dict[str, str] = {"q": q, "limit": str(eff_limit)}
+    if source in ("monid", "apify"):
+        qs_dict["source"] = source
+    qs = urllib.parse.urlencode(qs_dict)
+    candidates = [north] + ([south] if south != north else [])
+    for base in candidates:
+        w_code, w_data = _http_json("GET", f"{base}/gw/catalog?{qs}", token=token, timeout=4.0)
+        if w_code == 200 and isinstance(w_data, dict) and w_data.get("ok") is not False:
+            raw_totals = w_data.get("totals")
+            totals: dict[str, int] = {}
+            if isinstance(raw_totals, dict):
+                m_cnt = int(raw_totals.get("monid_endpoints") or 0)
+                a_cnt = int(raw_totals.get("apify_actors") or 0)
+                c_cnt = int(raw_totals.get("combined") or (m_cnt + a_cnt))
+                totals = {"monid_endpoints": m_cnt, "apify_actors": a_cnt, "combined": c_cnt}
+            raw_items = w_data.get("items")
+            matches: list[dict[str, Any]] = []
+            if isinstance(raw_items, list):
+                for it in raw_items[:eff_limit]:
+                    if isinstance(it, dict):
+                        matches.append(_compact_wholesale_item(it))
+            return totals, matches, w_data
+    return {}, [], None
+
+
 def _cmd_find(args: argparse.Namespace) -> int:
     north, south = _store_urls(args)
     tok, scrub = _resolve_token(args)
     q = (args.query_opt if args.query_opt is not None else (args.query or "")).strip()
-    tool_args: dict[str, Any] = {
-        "q": q,
-        "limit": max(1, min(int(args.limit), 100)),
-        "include_dead_ends": bool(args.include_dead_ends),
-        "only_in_proven": bool(args.only_in_proven),
-    }
-    if args.gate:
-        tool_args["gate"] = args.gate
+    lim = max(1, min(int(args.limit), 100))
+    raw_source = str(getattr(args, "source", "all") or "all").strip().lower()
+    legacy_wholesale = str(getattr(args, "wholesale", "") or "").strip().lower()
+    no_wholesale = bool(getattr(args, "no_wholesale", False)) or (raw_source == "cards")
+    want_cards = raw_source in ("all", "cards")
+    want_wholesale = (not no_wholesale) and raw_source in ("all", "monid", "apify")
+    cat_source = raw_source if raw_source in ("monid", "apify") else (
+        legacy_wholesale if legacy_wholesale in ("monid", "apify") else ""
+    )
 
-    code, is_err, data = _call_mcp_tool(north, "bazaar_find", tool_args, token=tok)
-    if code == 404:
-        qs: dict[str, str] = {"format": "json"}
-        if q:
-            qs["q"] = q
-        if args.gate:
-            qs["gate"] = args.gate
-        r_code, r_data = _http_json("GET", f"{south}/find?{urllib.parse.urlencode(qs)}", token=tok)
-        if r_code != 200 or not isinstance(r_data, dict):
-            return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=1)
-        raw_cards = r_data.get("cards") if isinstance(r_data.get("cards"), list) else []
-        pitfalls: list[dict[str, Any]] = []
-        filtered: list[dict[str, Any]] = []
-        for c in raw_cards:
-            if not isinstance(c, dict):
-                continue
-            dead = bool(c.get("is_dead_end")) or c.get("status_tag") == "dead_end"
-            if dead:
-                pitfalls.append({
-                    "card_id": c.get("card_id", ""),
-                    "kind": "dead_end",
-                    "title": c.get("title", ""),
-                    "warning": c.get("mechanism") or c.get("side_effects") or c.get("title", ""),
-                })
-            for rcpt in c.get("recent_receipts") or []:
-                if isinstance(rcpt, dict) and rcpt.get("pitfall_note"):
-                    pitfalls.append({
-                        "card_id": c.get("card_id", ""),
-                        "kind": "receipt_pitfall",
-                        "run_id": rcpt.get("run_id", ""),
-                        "warning": rcpt.get("pitfall_note", ""),
-                    })
-            if dead and not args.include_dead_ends:
-                continue
-            if args.only_in_proven and not (c.get("presence_state") == "in" and c.get("status_tag") == "proven"):
-                continue
-            filtered.append(c)
-        data = {
-            "ok": True,
-            "query": q,
-            "total_matched": len(raw_cards),
-            "count": len(filtered[: tool_args["limit"]]),
-            "cards": filtered[: tool_args["limit"]],
-            "pitfall_warnings": pitfalls,
+    is_err = False
+    cards_list: list[dict[str, Any]] = []
+    pitfalls_list: list[dict[str, Any]] = []
+    total_matched = 0
+    wholesale_totals: dict[str, int] = {}
+    wholesale_matches: list[dict[str, Any]] = []
+    mcp_grand_total = 0
+
+    if want_cards:
+        tool_args: dict[str, Any] = {
+            "q": q,
+            "limit": lim,
+            "include_dead_ends": bool(args.include_dead_ends),
+            "only_in_proven": bool(args.only_in_proven),
+            "include_wholesale": bool(want_wholesale and not cat_source),
         }
-        is_err = False
+        if args.gate:
+            tool_args["gate"] = args.gate
 
-    if args.wholesale:
-        w_qs = urllib.parse.urlencode({"source": args.wholesale, "q": q, "limit": str(min(int(args.limit), 20))})
-        w_code, w_data = _http_json("GET", f"{north}/gw/catalog?{w_qs}", token=tok)
-        data["wholesale_catalog"] = w_data if w_code == 200 else {"ok": False, "http_status": w_code}
+        code, is_err, mcp_data = _call_mcp_tool(north, "bazaar_find", tool_args, token=tok)
+        if code == 404:
+            qs: dict[str, str] = {"format": "json"}
+            if q:
+                qs["q"] = q
+            if args.gate:
+                qs["gate"] = args.gate
+            r_code, r_data = _http_json("GET", f"{south}/find?{urllib.parse.urlencode(qs)}", token=tok)
+            if r_code != 200 or not isinstance(r_data, dict):
+                return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=1)
+            raw_cards = r_data.get("cards") if isinstance(r_data.get("cards"), list) else []
+            for c in raw_cards:
+                if not isinstance(c, dict):
+                    continue
+                dead = bool(c.get("is_dead_end")) or c.get("status_tag") == "dead_end"
+                if dead:
+                    pitfalls_list.append({
+                        "card_id": c.get("card_id", ""),
+                        "kind": "dead_end",
+                        "title": c.get("title", ""),
+                        "warning": c.get("mechanism") or c.get("side_effects") or c.get("title", ""),
+                    })
+                for rcpt in c.get("recent_receipts") or []:
+                    if isinstance(rcpt, dict) and rcpt.get("pitfall_note"):
+                        pitfalls_list.append({
+                            "card_id": c.get("card_id", ""),
+                            "kind": "receipt_pitfall",
+                            "run_id": rcpt.get("run_id", ""),
+                            "warning": rcpt.get("pitfall_note", ""),
+                        })
+                if dead and not args.include_dead_ends:
+                    continue
+                if args.only_in_proven and not (c.get("presence_state") == "in" and c.get("status_tag") == "proven"):
+                    continue
+                cards_list.append(c)
+            total_matched = len(raw_cards)
+            cards_list = cards_list[:lim]
+            is_err = False
+        elif is_err:
+            return _emit(mcp_data, secrets_to_scrub=scrub, exit_code=1)
+        else:
+            cards_list = list(mcp_data.get("cards") or [])
+            pitfalls_list = list(mcp_data.get("pitfall_warnings") or [])
+            total_matched = int(mcp_data.get("total_matched") or len(cards_list))
+            if isinstance(mcp_data.get("wholesale_totals"), dict) and mcp_data["wholesale_totals"]:
+                wholesale_totals = dict(mcp_data["wholesale_totals"])
+            if isinstance(mcp_data.get("wholesale_matches"), list):
+                wholesale_matches = list(mcp_data["wholesale_matches"])
+            mcp_grand_total = int(mcp_data.get("grand_total_capabilities") or 0)
+
+    raw_w_data: dict[str, Any] | None = None
+    if want_wholesale and (cat_source or not wholesale_totals):
+        cat_lim = min(lim, 6) if (not q and want_cards) else min(lim, 20)
+        w_totals, w_matches, raw_w_data = _fetch_wholesale_catalog(
+            north,
+            south,
+            q=q,
+            limit=cat_lim,
+            source=cat_source,
+            token=tok,
+        )
+        if w_totals:
+            wholesale_totals = w_totals
+        if w_matches or cat_source:
+            wholesale_matches = w_matches
+
+    combined_wholesale = int(wholesale_totals.get("combined") or 0)
+    computed_grand = total_matched + combined_wholesale
+    grand_total = max(mcp_grand_total, computed_grand) if not no_wholesale else total_matched
+
+    data: dict[str, Any] = {
+        "ok": True,
+        "query": q,
+        "gate": args.gate or "",
+        "source": raw_source,
+        "total_matched": total_matched,
+        "count": len(cards_list),
+        "cards": cards_list,
+        "pitfall_warnings": pitfalls_list,
+        "wholesale_matches": wholesale_matches,
+        "wholesale_totals": wholesale_totals,
+        "grand_total_capabilities": grand_total,
+    }
+    if legacy_wholesale:
+        if raw_w_data is not None:
+            data["wholesale_catalog"] = raw_w_data
+        elif wholesale_totals:
+            data["wholesale_catalog"] = {"ok": True, "totals": wholesale_totals, "items": wholesale_matches}
+        else:
+            data["wholesale_catalog"] = {"ok": False, "http_status": 404}
 
     return _emit(data, secrets_to_scrub=scrub, exit_code=(1 if is_err else 0))
 
@@ -644,16 +820,29 @@ def _cmd_use(args: argparse.Namespace) -> int:
     if not isinstance(inputs_obj, dict):
         return _emit({"ok": False, "error": "--inputs must decode to a JSON object"}, secrets_to_scrub=scrub, exit_code=2)
 
+    try:
+        bridge_cid, effective_inputs, bridged_catalog_id = _resolve_wholesale_bridge(args.card_id, inputs_obj)
+    except ValueError as exc:
+        return _emit({"ok": False, "code": "bad_request", "error": str(exc)}, secrets_to_scrub=scrub, exit_code=2)
+
+    target_card_id = bridge_cid if bridge_cid is not None else args.card_id
+    eff_timeout_sec: float | None = (
+        float(args.timeout_sec)
+        if args.timeout_sec is not None
+        else (45.0 if bridged_catalog_id is not None else None)
+    )
+    http_wait_sec = max(30.0, float(eff_timeout_sec or 25.0) + 10.0)
+
     idem_key = (args.idem_key or f"bazaar_{secrets.token_hex(8)}").strip()
     tool_args: dict[str, Any] = {
-        "card_id": args.card_id,
-        "inputs": inputs_obj,
+        "card_id": bridged_catalog_id if bridged_catalog_id is not None else target_card_id,
+        "inputs": effective_inputs,
         "idem_key": idem_key,
     }
     if args.max_price_micros is not None:
         tool_args["max_price_micros"] = int(args.max_price_micros)
-    if args.timeout_sec is not None:
-        tool_args["timeout_sec"] = float(args.timeout_sec)
+    if eff_timeout_sec is not None:
+        tool_args["timeout_sec"] = eff_timeout_sec
     if args.trace_id:
         tool_args["trace_id"] = args.trace_id
 
@@ -662,27 +851,35 @@ def _cmd_use(args: argparse.Namespace) -> int:
         "bazaar_use",
         tool_args,
         token=tok,
-        timeout=max(30.0, float(args.timeout_sec or 25.0) + 10.0),
+        timeout=http_wait_sec,
     )
-    if code == 404:
-        use_body: dict[str, Any] = {"input": inputs_obj, "idem_key": idem_key}
+    if code == 404 or (
+        bridged_catalog_id is not None
+        and is_err
+        and data.get("code") == "bad_request"
+        and "card_id" in str(data.get("error") or "")
+    ):
+        use_body: dict[str, Any] = {"input": effective_inputs, "idem_key": idem_key}
         if args.max_price_micros is not None:
             use_body["max_cost_micros"] = int(args.max_price_micros)
-        if args.timeout_sec is not None:
-            use_body["timeout_sec"] = float(args.timeout_sec)
+        if eff_timeout_sec is not None:
+            use_body["timeout_sec"] = eff_timeout_sec
         if args.trace_id:
             use_body["trace_id"] = args.trace_id
         r_code, r_data = _http_json(
             "POST",
-            f"{south}/use/{urllib.parse.quote(args.card_id, safe='')}",
+            f"{south}/use/{urllib.parse.quote(target_card_id, safe='')}",
             token=tok,
             body=use_body,
             extra_headers={"Idempotency-Key": idem_key},
-            timeout=max(30.0, float(args.timeout_sec or 25.0) + 10.0),
+            timeout=http_wait_sec,
         )
         data = r_data if isinstance(r_data, dict) else {"ok": False, "data": r_data}
         is_err = r_code != 200 or not data.get("ok")
 
+    if bridged_catalog_id is not None and isinstance(data, dict):
+        data.setdefault("bridged_catalog_id", bridged_catalog_id)
+        data.setdefault("bridge_card_id", target_card_id)
     data.setdefault("idem_key", idem_key)
     err_txt = str(data.get("error") or "").lower()
     if is_err and ("balance" in err_txt or "insufficient" in err_txt or "limit" in err_txt):
@@ -1189,17 +1386,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("wallet", parents=[common], help="Inspect unified account wallet balance, caps & capability counts")
     sub.add_parser("whoami", parents=[common], help="Inspect active key identity & limits")
 
-    p_find = sub.add_parser("find", parents=[common], help="Search live proven hands & pitfall_warnings")
+    p_find = sub.add_parser("find", parents=[common], help="Search all 120,000+ capabilities (Tier-1 cards + Monid + Apify)")
     p_find.add_argument("query", nargs="?", default="", help="Goal or domain keywords")
     p_find.add_argument("-q", "--query", dest="query_opt", default=None, help="Keywords (flag form)")
     p_find.add_argument("--gate", default="", help="Optional gate filter")
     p_find.add_argument("--limit", type=int, default=12, help="Max cards (default: 12)")
     p_find.add_argument("--include-dead-ends", action="store_true", help="Include dead_end cards in cards list")
     p_find.add_argument("--only-in-proven", action="store_true", help="Only live in + proven hands")
-    p_find.add_argument("--wholesale", choices=["monid", "apify", "all"], default="", help="Also search wholesale catalog")
+    p_find.add_argument("--no-wholesale", action="store_true", help="Only return Tier-1 causal cards (skip /gw/catalog)")
+    p_find.add_argument(
+        "--source",
+        choices=["all", "cards", "monid", "apify"],
+        default="all",
+        help="Filter capability source (default: all)",
+    )
+    p_find.add_argument("--wholesale", choices=["monid", "apify", "all"], default="", help="Legacy wholesale catalog filter")
 
-    p_use = sub.add_parser("use", parents=[common], help="Invoke capability with idem_key & max-price-micros ceiling")
-    p_use.add_argument("card_id", help="Card ID to invoke")
+    p_use = sub.add_parser("use", parents=[common], help="Invoke capability (or monid:<ep> / apify:<actor>) with idem_key & max-price-micros ceiling")
+    p_use.add_argument("card_id", help="Card ID or monid:<endpoint> / apify:<actor_id>")
     p_use.add_argument("--inputs", "--input", dest="inputs", default="{}", help="JSON object payload")
     p_use.add_argument("--input-file", default="", help="Read JSON input object from file")
     p_use.add_argument("--idem-key", default="", help="Idempotency key (auto-generated if omitted)")
