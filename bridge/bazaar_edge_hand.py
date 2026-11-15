@@ -34,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1231,6 +1231,7 @@ class StoreV2Client:
         self.ssl_context = ssl_context or ssl.create_default_context()
         self._poll_lock = threading.Lock()
         self._active_poll_conn: http.client.HTTPConnection | None = None
+        self._active_poll_conns: set[http.client.HTTPConnection] = set()
 
     def request_json(
         self,
@@ -1273,26 +1274,37 @@ class StoreV2Client:
             return 0, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def interrupt_poll(self) -> None:
-        """Immediately wake up any in-flight GET /events/wait socket."""
+        """Immediately wake up all in-flight GET /events/wait sockets."""
         with self._poll_lock:
-            conn = self._active_poll_conn
+            conns = list(self._active_poll_conns)
+            if self._active_poll_conn is not None and self._active_poll_conn not in self._active_poll_conns:
+                conns.append(self._active_poll_conn)
+            self._active_poll_conns.clear()
             self._active_poll_conn = None
-        if conn is None:
-            return
-        sock = getattr(conn, "sock", None)
-        if sock is not None:
+        for conn in conns:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
-                sock.shutdown(socket.SHUT_RDWR)
+                conn.close()
             except OSError:
                 pass
-        try:
-            conn.close()
-        except OSError:
-            pass
 
-    def wait_events(self, hand_id: str, *, poll_timeout: float = 20.0) -> tuple[int, dict[str, Any]]:
+    def wait_events(
+        self,
+        hand_id: str,
+        *,
+        poll_timeout: float = 20.0,
+        allow_owner_wildcard: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        hid = (hand_id or "").strip()
+        if not hid and not allow_owner_wildcard:
+            raise BridgeError("hand_id must be non-empty for /events/wait unless allow_owner_wildcard=True")
         eff_wait = min(max(float(poll_timeout), 0.05), 30.0)
-        qs = urllib.parse.urlencode({"hand_id": hand_id, "timeout": f"{eff_wait:.2f}"})
+        qs = urllib.parse.urlencode({"hand_id": hid, "timeout": f"{eff_wait:.2f}"})
         parsed = urllib.parse.urlsplit(self.store_url)
         base_path = parsed.path.rstrip("/")
         req_path = f"{base_path}/events/wait?{qs}"
@@ -1319,6 +1331,7 @@ class StoreV2Client:
             "Connection": "close",
         }
         with self._poll_lock:
+            self._active_poll_conns.add(conn)
             self._active_poll_conn = conn
         try:
             conn.request("GET", req_path, headers=hdrs)
@@ -1332,8 +1345,9 @@ class StoreV2Client:
             return 0, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         finally:
             with self._poll_lock:
+                self._active_poll_conns.discard(conn)
                 if self._active_poll_conn is conn:
-                    self._active_poll_conn = None
+                    self._active_poll_conn = next(iter(self._active_poll_conns), None)
             try:
                 conn.close()
             except OSError:
@@ -1362,6 +1376,98 @@ def _token_supports_hand_ops(
     return isinstance(allow_ops, list) and "hand" in allow_ops
 
 
+def _read_local_account_session_token(path: Path) -> str:
+    """Read an account session or buyer token from `account_session.json` or a plain-text file."""
+    resolved = path.expanduser()
+    if not resolved.is_file():
+        return ""
+    try:
+        raw = resolved.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            return ""
+        if isinstance(obj, dict):
+            for field_name in (
+                "session_token",
+                "account_token",
+                "buyer_token",
+                "buyer_key",
+                "token",
+                "api_key",
+            ):
+                val = obj.get(field_name)
+                if isinstance(val, str):
+                    norm = _normalize_store_token(val)
+                    if norm:
+                        return norm
+        return ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _normalize_store_token(stripped)
+    return ""
+
+
+def _is_safe_account_bind_url(url: str, environ: Mapping[str, str]) -> bool:
+    """Allow forwarding local account credentials only over HTTPS or loopback (unless explicitly overridden)."""
+    parsed = urllib.parse.urlsplit(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https":
+        return True
+    if scheme == "http" and host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    return str(environ.get("BAZAAR_ALLOW_INSECURE_HTTP") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _discover_local_account_token(
+    *,
+    reg_url: str,
+    account_token: str,
+    bind_local_account: bool,
+    keyring_dirs: Sequence[Path],
+    fallback_buyer_tok: str,
+    environ: Mapping[str, str],
+) -> str:
+    explicit_tok = _normalize_store_token(account_token)
+    if explicit_tok:
+        if not _is_safe_account_bind_url(reg_url, environ):
+            raise BridgeError(f"Refusing to send account_token over insecure non-loopback HTTP URL: {reg_url}")
+        return explicit_tok
+    if not bind_local_account or not _is_safe_account_bind_url(reg_url, environ):
+        return ""
+    for env_key in ("BAZAAR_ACCOUNT_TOKEN", "BAZAAR_ACCOUNT_SESSION_TOKEN"):
+        cand = _normalize_store_token(environ.get(env_key) or "")
+        if cand:
+            return cand
+    if fallback_buyer_tok:
+        return fallback_buyer_tok
+    seen_dirs: set[Path] = set()
+    for kd in keyring_dirs:
+        resolved_dir = kd.expanduser()
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+        buyer_file = resolved_dir / "buyer_key"
+        if buyer_file.is_file():
+            btok = _read_store_key_file(buyer_file)
+            if btok:
+                return btok
+        sess_file = resolved_dir / "account_session.json"
+        if sess_file.is_file():
+            stok = _read_local_account_session_token(sess_file)
+            if stok:
+                return stok
+    return ""
+
+
 def resolve_or_onboard_api_key(
     *,
     store_url: str,
@@ -1371,6 +1477,9 @@ def resolve_or_onboard_api_key(
     owner_label: str = "external_edge_hand",
     onboarding_url: str = "",
     argv_token: str = "",
+    account_token: str = "",
+    bind_local_account: bool = True,
+    keyring_dir: str | Path | None = None,
     env: dict[str, str] | None = None,
     ssl_context: ssl.SSLContext | None = None,
     log_stream: Any = None,
@@ -1403,10 +1512,15 @@ def resolve_or_onboard_api_key(
         return seller_env_tok, None
 
     home_dir = Path(environ["HOME"]) if environ.get("HOME") else Path.home()
+    default_keyring_dir = Path(
+        keyring_dir
+        or environ.get("BAZAAR_KEYRING_DIR")
+        or (home_dir / ".causal-store-v2")
+    ).expanduser()
     default_seat_path = Path(
         seat_key_file
         or environ.get("BAZAAR_EDGE_SEAT_KEY_FILE")
-        or (home_dir / ".causal-store-v2" / "edge_seat_key")
+        or (default_keyring_dir / "edge_seat_key")
     ).expanduser()
     save_target = Path(key_file).expanduser() if key_file else default_seat_path
     existing_seat_tok = _read_store_key_file(save_target) if save_target.is_file() else ""
@@ -1416,6 +1530,7 @@ def resolve_or_onboard_api_key(
         return existing_seat_tok, save_target
 
     env_tok = _normalize_store_token(environ.get("BAZAAR_API_KEY") or environ.get("CAUSAL_STORE_API_KEY") or "")
+    fallback_buyer_env_tok = ""
     if env_tok:
         if existing_seat_tok and existing_seat_tok != env_tok:
             # Common Personal-Agent case: env.sh exported buyer_key into BAZAAR_API_KEY while edge_seat_key holds hand ops.
@@ -1429,6 +1544,7 @@ def resolve_or_onboard_api_key(
         if auto_onboard and not existing_seat_tok:
             if _token_supports_hand_ops(store_url, env_tok, ssl_context=ssl_context):
                 return env_tok, None
+            fallback_buyer_env_tok = env_tok
             _log(
                 "Ambient BAZAAR_API_KEY lacks seller `hand` permission; proceeding with --auto-onboard seller seat registration",
                 stream=log_stream,
@@ -1450,14 +1566,29 @@ def resolve_or_onboard_api_key(
         or environ.get("BAZAAR_ONBOARDING_URL", "").strip()
         or f"{store_url.rstrip('/')}/bridge/register"
     )
-    client = StoreV2Client(store_url=store_url, token="", ssl_context=ssl_context)
+    candidate_keyring_dirs: list[Path] = []
+    if keyring_dir or environ.get("BAZAAR_KEYRING_DIR"):
+        candidate_keyring_dirs.append(default_keyring_dir)
+    elif env is not None and not environ.get("HOME") and not environ.get("BAZAAR_KEYRING_DIR") and keyring_dir is None:
+        candidate_keyring_dirs.append(save_target.parent)
+    else:
+        candidate_keyring_dirs.extend([save_target.parent, default_keyring_dir])
+    resolved_acct_tok = _discover_local_account_token(
+        reg_url=reg_url,
+        account_token=account_token,
+        bind_local_account=bind_local_account,
+        keyring_dirs=candidate_keyring_dirs,
+        fallback_buyer_tok=fallback_buyer_env_tok,
+        environ=environ,
+    )
+    client = StoreV2Client(store_url=store_url, token=resolved_acct_tok, ssl_context=ssl_context)
     clean_label = (owner_label or "external_edge_hand").strip()[:80] or "external_edge_hand"
     st, data = client.request_json(
         "POST",
         reg_url,
         payload={"owner_label": clean_label, "label": clean_label},
         timeout=15.0,
-        auth=False,
+        auth=bool(resolved_acct_tok),
     )
     if st not in (200, 201) or not isinstance(data, dict):
         raise BridgeError(f"Auto-onboard POST {reg_url} failed (HTTP {st}): {data}")
@@ -1478,24 +1609,32 @@ def resolve_or_onboard_api_key(
         raise BridgeError(f"Auto-onboard response from {reg_url} did not contain a token: {data}")
 
     saved_path = save_key_0600(save_target, minted_tok)
+    bind_suffix = (
+        f" account_bound=True (account_id={data.get('bound_account_id')})"
+        if data.get("account_bound")
+        else ""
+    )
     _log(
         f"Auto-onboarded Seller seat key (owner_id={data.get('owner_id') or nested.get('owner_id')}) "
-        f"and saved 0600 to {saved_path}",
+        f"and saved 0600 to {saved_path}{bind_suffix}",
         stream=log_stream,
     )
     return minted_tok, saved_path
 
 
 class EdgeHandBridge:
-    """Lifecycle manager & event loop bridging Causal Store v2 async_poll to an EdgeAdapter."""
+    """Lifecycle manager & event loop bridging Causal Store v2 async_poll to one or more EdgeAdapters."""
 
     def __init__(
         self,
         *,
         store_url: str,
         token: str,
-        spec: CardHandSpec,
-        adapter: EdgeAdapter,
+        spec: CardHandSpec | None = None,
+        adapter: EdgeAdapter | None = None,
+        hands: Sequence[tuple[CardHandSpec, EdgeAdapter]] | None = None,
+        specs: Sequence[CardHandSpec] | None = None,
+        adapters: Sequence[EdgeAdapter] | Mapping[str, EdgeAdapter] | None = None,
         poll_timeout: float = 20.0,
         install_signals: bool = True,
         ssl_context: ssl.SSLContext | None = None,
@@ -1504,8 +1643,45 @@ class EdgeHandBridge:
         if not token or not token.strip():
             raise BridgeError("API token is required")
         self.client = StoreV2Client(store_url=store_url, token=token.strip(), ssl_context=ssl_context)
-        self.spec = spec
-        self.adapter = adapter
+
+        resolved_hands: list[tuple[CardHandSpec, EdgeAdapter]] = []
+        if hands is not None:
+            for item in hands:
+                if not isinstance(item, (tuple, list)) or len(item) != 2:
+                    raise BridgeError("hands entries must be (CardHandSpec, EdgeAdapter) pairs")
+                resolved_hands.append((item[0], item[1]))
+        if specs is not None:
+            spec_list = list(specs)
+            if isinstance(adapters, Mapping):
+                for s_item in spec_list:
+                    ad = adapters.get(s_item.hand_id) or adapters.get(s_item.card_id) or adapter
+                    if ad is None:
+                        raise BridgeError(f"Missing EdgeAdapter for hand_id={s_item.hand_id!r}")
+                    resolved_hands.append((s_item, ad))
+            elif adapters is not None:
+                ad_list = list(adapters)
+                if len(ad_list) != len(spec_list):
+                    raise BridgeError("specs and adapters sequences must have identical length")
+                resolved_hands.extend(zip(spec_list, ad_list))
+            else:
+                if adapter is None:
+                    raise BridgeError("adapter is required when passing specs without adapters")
+                for s_item in spec_list:
+                    resolved_hands.append((s_item, adapter))
+        if spec is not None:
+            if adapter is None:
+                raise BridgeError("adapter is required when spec is provided")
+            resolved_hands.insert(0, (spec, adapter))
+        if not resolved_hands:
+            raise BridgeError("At least one CardHandSpec and EdgeAdapter must be provided")
+
+        self._hands: list[tuple[CardHandSpec, EdgeAdapter]] = []
+        self._hand_by_id: dict[str, tuple[CardHandSpec, EdgeAdapter]] = {}
+        for s_item, ad_item in resolved_hands:
+            self._append_validated_hand(s_item, ad_item)
+
+        self.spec = self._hands[0][0]
+        self.adapter = self._hands[0][1]
         self.poll_timeout = min(max(float(poll_timeout), 0.05), 30.0)
         self.install_signals = install_signals
         self.log_stream = log_stream
@@ -1513,17 +1689,39 @@ class EdgeHandBridge:
         self.whoami_info: dict[str, Any] = {}
         self.registered_hand: dict[str, Any] = {}
         self.registered_card: dict[str, Any] = {}
+        self.registered_hands: dict[str, dict[str, Any]] = {}
+        self.registered_cards: dict[str, dict[str, Any]] = {}
 
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
         self._presence_active = False
         self._marked_away = False
         self._in_poll_wait = False
+        self._active_poll_waiters = 0
         self._prev_sigint: Any = None
         self._prev_sigterm: Any = None
         self._signals_installed = False
         self._fulfilled_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._card_price_cache: dict[str, int] = {}
+
+    @property
+    def specs(self) -> list[CardHandSpec]:
+        return [s for s, _ in self._hands]
+
+    def _append_validated_hand(self, spec_item: CardHandSpec, adapter_item: EdgeAdapter) -> None:
+        hid = (spec_item.hand_id or "").strip()
+        if not hid:
+            raise BridgeError("CardHandSpec.hand_id must be non-empty")
+        spec_item.hand_id = hid
+        if hid in self._hand_by_id:
+            raise BridgeError(f"Duplicate hand_id on EdgeHandBridge: {hid!r}")
+        self._hands.append((spec_item, adapter_item))
+        self._hand_by_id[hid] = (spec_item, adapter_item)
+
+    def add_hand(self, spec_item: CardHandSpec, adapter_item: EdgeAdapter | None = None) -> None:
+        """Register an additional (CardHandSpec, EdgeAdapter) on this bridge prior to starting."""
+        eff_adapter = adapter_item if adapter_item is not None else self.adapter
+        self._append_validated_hand(spec_item, eff_adapter)
 
     def verify_whoami(self) -> dict[str, Any]:
         st, data = self.client.request_json("GET", "/whoami", timeout=10.0)
@@ -1544,96 +1742,135 @@ class EdgeHandBridge:
 
         who = self.whoami_info
         owner_id = str(who.get("owner_id") or "")
-
-        # Preserve immutable hand_id if card already exists under our owner_id
-        if self.spec.card_id and not self.spec.skip_card:
-            cst, cdata = self.client.request_json(
-                "GET",
-                f"/card/{urllib.parse.quote(self.spec.card_id, safe='')}",
-                timeout=10.0,
-            )
-            if cst == 200 and isinstance(cdata.get("card"), dict):
-                existing = cdata["card"]
-                if existing.get("owner_id") == owner_id and existing.get("hand_id"):
-                    self.spec.hand_id = str(existing["hand_id"])
-
         k_kind = str(who.get("kind") or "internal")
-        if k_kind == "founder":
-            pc_cap = max(500_000, self.spec.price_micros)
-            dl_cap = max(2_000_000, self.spec.price_micros * 100)
-        else:
-            k_pc = int(who.get("per_call_limit_micros") or 0)
-            k_dl = int(who.get("daily_limit_micros") or 0)
-            pc_cap = min(k_pc, max(500_000, self.spec.price_micros))
-            dl_cap = min(k_dl, max(2_000_000, self.spec.price_micros * 100))
-            if self.spec.price_micros > pc_cap:
-                _log(
-                    f"WARNING: card price_micros ({self.spec.price_micros}) exceeds seat key "
-                    f"per_call_limit_micros ({pc_cap}); zero-custody seat keys require price_micros=0 "
-                    f"until upgraded.",
-                    stream=self.log_stream,
+
+        for idx, (spec_item, adapter_item) in enumerate(self._hands):
+            old_hid = spec_item.hand_id
+            # Preserve immutable hand_id if card already exists under our owner_id
+            if spec_item.card_id and not spec_item.skip_card:
+                cst, cdata = self.client.request_json(
+                    "GET",
+                    f"/card/{urllib.parse.quote(spec_item.card_id, safe='')}",
+                    timeout=10.0,
                 )
+                if cst == 200 and isinstance(cdata.get("card"), dict):
+                    existing = cdata["card"]
+                    if existing.get("owner_id") == owner_id and existing.get("hand_id"):
+                        rebound_hid = str(existing["hand_id"]).strip()
+                        if rebound_hid and rebound_hid != old_hid:
+                            if rebound_hid in self._hand_by_id and self._hand_by_id[rebound_hid][0] is not spec_item:
+                                raise BridgeError(f"Duplicate hand_id after existing card rebind: {rebound_hid!r}")
+                            self._hand_by_id.pop(old_hid, None)
+                            spec_item.hand_id = rebound_hid
+                            self._hand_by_id[rebound_hid] = (spec_item, adapter_item)
 
-        hand_payload = {
-            "hand_id": self.spec.hand_id,
-            "label": self.spec.title or f"Edge Hand ({self.spec.hand_id})",
-            "kind": "async_poll",
-            "endpoint": "",
-            "upstream_url": "",
-            "per_call_limit_micros": pc_cap,
-            "daily_limit_micros": dl_cap,
-            "presence_state": "in",
-            "presence_note": self.spec.presence_note,
-        }
-        hst, hres = self.client.request_json("POST", "/hand", payload=hand_payload, timeout=10.0)
-        if hst != 200 or not hres.get("ok"):
-            raise BridgeError(f"POST /hand failed (HTTP {hst}): {hres.get('error') or hres}")
-        self.registered_hand = hres
+            if not (spec_item.hand_id or "").strip():
+                raise BridgeError("CardHandSpec.hand_id must be non-empty")
 
-        if not self.spec.skip_card:
-            card_payload = {
-                "card_id": self.spec.card_id,
-                "title": self.spec.title,
-                "price_micros": self.spec.price_micros,
-                "gate": self.spec.gate,
-                "inputs_spec": self.spec.inputs_spec,
-                "outputs_spec": self.spec.outputs_spec,
-                "mechanism": self.spec.mechanism,
-                "preconditions": self.spec.preconditions,
-                "side_effects": self.spec.side_effects,
-                "hand_id": self.spec.hand_id,
-                "is_public": self.spec.is_public,
+            if k_kind == "founder":
+                pc_cap = max(500_000, spec_item.price_micros)
+                dl_cap = max(2_000_000, spec_item.price_micros * 100)
+            else:
+                k_pc = int(who.get("per_call_limit_micros") or 0)
+                k_dl = int(who.get("daily_limit_micros") or 0)
+                pc_cap = min(k_pc, max(500_000, spec_item.price_micros))
+                dl_cap = min(k_dl, max(2_000_000, spec_item.price_micros * 100))
+                if spec_item.price_micros > pc_cap:
+                    _log(
+                        f"WARNING: card price_micros ({spec_item.price_micros}) exceeds seat key "
+                        f"per_call_limit_micros ({pc_cap}); zero-custody seat keys require price_micros=0 "
+                        f"until upgraded.",
+                        stream=self.log_stream,
+                    )
+
+            hand_payload = {
+                "hand_id": spec_item.hand_id,
+                "label": spec_item.title or f"Edge Hand ({spec_item.hand_id})",
+                "kind": "async_poll",
+                "endpoint": "",
+                "upstream_url": "",
+                "per_call_limit_micros": pc_cap,
+                "daily_limit_micros": dl_cap,
+                "presence_state": "in",
+                "presence_note": spec_item.presence_note,
             }
-            cst, cres = self.client.request_json("POST", "/card", payload=card_payload, timeout=10.0)
-            if cst != 200 or not cres.get("ok"):
-                raise BridgeError(f"POST /card failed (HTTP {cst}): {cres.get('error') or cres}")
-            self.registered_card = cres
-            if self.spec.card_id:
-                self._card_price_cache[self.spec.card_id] = max(0, int(self.spec.price_micros))
+            hst, hres = self.client.request_json("POST", "/hand", payload=hand_payload, timeout=10.0)
+            if hst != 200 or not hres.get("ok"):
+                raise BridgeError(f"POST /hand failed (HTTP {hst}): {hres.get('error') or hres}")
+            self.registered_hands[spec_item.hand_id] = hres
+            if idx == 0:
+                self.registered_hand = hres
 
-        self.set_presence("in", note=self.spec.presence_note)
-        _log(
-            f"Mounted hand_id={self.spec.hand_id} card_id={self.spec.card_id or '(none)'} "
-            f"adapter={self.adapter.name} presence=in",
-            stream=self.log_stream,
-        )
+            if not spec_item.skip_card:
+                card_payload = {
+                    "card_id": spec_item.card_id,
+                    "title": spec_item.title,
+                    "price_micros": spec_item.price_micros,
+                    "gate": spec_item.gate,
+                    "inputs_spec": spec_item.inputs_spec,
+                    "outputs_spec": spec_item.outputs_spec,
+                    "mechanism": spec_item.mechanism,
+                    "preconditions": spec_item.preconditions,
+                    "side_effects": spec_item.side_effects,
+                    "hand_id": spec_item.hand_id,
+                    "is_public": spec_item.is_public,
+                }
+                cst, cres = self.client.request_json("POST", "/card", payload=card_payload, timeout=10.0)
+                if cst != 200 or not cres.get("ok"):
+                    raise BridgeError(f"POST /card failed (HTTP {cst}): {cres.get('error') or cres}")
+                if spec_item.card_id:
+                    self.registered_cards[spec_item.card_id] = cres
+                    self._card_price_cache[spec_item.card_id] = max(0, int(spec_item.price_micros))
+                if idx == 0:
+                    self.registered_card = cres
 
-    def set_presence(self, state: str, *, note: str = "", timeout: float = 3.0) -> dict[str, Any]:
-        st, res = self.client.request_json(
-            "POST",
-            "/presence",
-            payload={
-                "hand_id": self.spec.hand_id,
-                "state": state,
-                "note": note or (self.spec.presence_note if state == "in" else self.spec.away_note),
-            },
-            timeout=timeout,
-        )
-        if st == 200 and res.get("ok"):
+            self.set_presence("in", note=spec_item.presence_note, hand_id=spec_item.hand_id)
+            _log(
+                f"Mounted hand_id={spec_item.hand_id} card_id={spec_item.card_id or '(none)'} "
+                f"adapter={adapter_item.name} presence=in",
+                stream=self.log_stream,
+            )
+
+    def set_presence(
+        self,
+        state: str,
+        *,
+        note: str = "",
+        hand_id: str | None = None,
+        timeout: float = 3.0,
+    ) -> dict[str, Any]:
+        targets: list[CardHandSpec]
+        if hand_id is not None:
+            clean_hid = hand_id.strip()
+            if not clean_hid:
+                raise BridgeError("hand_id must be non-empty for set_presence")
+            pair = self._hand_by_id.get(clean_hid)
+            targets = [pair[0]] if pair is not None else [CardHandSpec(hand_id=clean_hid)]
+        else:
+            targets = [s for s, _ in self._hands]
+
+        last_res: dict[str, Any] = {}
+        any_ok = False
+        for s_item in targets:
+            eff_note = note or (s_item.presence_note if state == "in" else s_item.away_note)
+            st, res = self.client.request_json(
+                "POST",
+                "/presence",
+                payload={
+                    "hand_id": s_item.hand_id,
+                    "state": state,
+                    "note": eff_note,
+                },
+                timeout=timeout,
+            )
+            last_res = res
+            if st == 200 and res.get("ok"):
+                any_ok = True
+        if any_ok:
             with self._state_lock:
                 self._presence_active = state == "in"
                 self._marked_away = state == "away"
-        return res
+        return last_res
 
     def mark_away_once(self) -> None:
         with self._state_lock:
@@ -1641,16 +1878,17 @@ class EdgeHandBridge:
                 return
             self._marked_away = True
             self._presence_active = False
-        try:
-            self.client.request_json(
-                "POST",
-                "/presence",
-                payload={"hand_id": self.spec.hand_id, "state": "away", "note": self.spec.away_note},
-                timeout=2.5,
-            )
-            _log(f"Set presence_state=away for hand_id={self.spec.hand_id}", stream=self.log_stream)
-        except Exception:
-            pass
+        for s_item, _ in self._hands:
+            try:
+                self.client.request_json(
+                    "POST",
+                    "/presence",
+                    payload={"hand_id": s_item.hand_id, "state": "away", "note": s_item.away_note},
+                    timeout=2.5,
+                )
+                _log(f"Set presence_state=away for hand_id={s_item.hand_id}", stream=self.log_stream)
+            except Exception:
+                pass
 
     def stop(self) -> None:
         """Signal loop termination, unblock active /events/wait immediately, and set presence=away."""
@@ -1667,7 +1905,7 @@ class EdgeHandBridge:
             _log(f"Received signal {signum}; shutting down and setting presence=away...", stream=self.log_stream)
             self._stop_event.set()
             self.client.interrupt_poll()
-            if self._in_poll_wait:
+            if self._in_poll_wait and len(self._hands) == 1:
                 raise _PollInterrupted()
 
         self._prev_sigint = signal.getsignal(signal.SIGINT)
@@ -1709,14 +1947,32 @@ class EdgeHandBridge:
     def close(self) -> None:
         self.stop()
         self._restore_signal_handlers()
-        self.adapter.close()
+        closed_ids: set[int] = set()
+        for _, ad_item in self._hands:
+            if id(ad_item) not in closed_ids:
+                closed_ids.add(id(ad_item))
+                ad_item.close()
 
-    def _resolve_price_cap(self, card_id: str, max_cost_micros: int) -> int:
-        if card_id and card_id in self._card_price_cache:
-            return self._card_price_cache[card_id]
-        if card_id and card_id == self.spec.card_id and not self.spec.skip_card:
-            cap = max(0, int(self.spec.price_micros))
-            self._card_price_cache[card_id] = cap
+    def _resolve_hand_target(self, event: dict[str, Any]) -> tuple[CardHandSpec, EdgeAdapter]:
+        ev_hid = str(event.get("hand_id") or "").strip()
+        if ev_hid and ev_hid in self._hand_by_id:
+            return self._hand_by_id[ev_hid]
+        ev_cid = str(event.get("card_id") or "").strip()
+        if ev_cid:
+            for s_item, ad_item in self._hands:
+                if s_item.card_id == ev_cid:
+                    return s_item, ad_item
+        return self.spec, self.adapter
+
+    def _resolve_price_cap(self, card_id: str, max_cost_micros: int, *, active_spec: CardHandSpec | None = None) -> int:
+        spec_ref = active_spec or self.spec
+        with self._state_lock:
+            if card_id and card_id in self._card_price_cache:
+                return self._card_price_cache[card_id]
+        if card_id and card_id == spec_ref.card_id and not spec_ref.skip_card:
+            cap = max(0, int(spec_ref.price_micros))
+            with self._state_lock:
+                self._card_price_cache[card_id] = cap
             return cap
         if card_id:
             cst, cdata = self.client.request_json(
@@ -1726,10 +1982,11 @@ class EdgeHandBridge:
             )
             if cst == 200 and isinstance(cdata.get("card"), dict) and cdata["card"].get("price_micros") is not None:
                 cap = max(0, int(cdata["card"]["price_micros"]))
-                self._card_price_cache[card_id] = cap
+                with self._state_lock:
+                    self._card_price_cache[card_id] = cap
                 return cap
-        if not self.spec.skip_card:
-            return max(0, int(self.spec.price_micros))
+        if not spec_ref.skip_card:
+            return max(0, int(spec_ref.price_micros))
         return max(0, int(max_cost_micros or 0))
 
     def _build_safe_fulfill_payload(
@@ -1739,11 +1996,15 @@ class EdgeHandBridge:
         max_cost_micros: int,
         *,
         price_micros: int | None = None,
+        active_spec: CardHandSpec | None = None,
+        active_adapter: EdgeAdapter | None = None,
     ) -> dict[str, Any]:
+        spec_ref = active_spec or self.spec
+        ad_ref = active_adapter or self.adapter
         secrets_to_scrub = [self.client.token] if self.client.token else []
         outcome = exec_res.outcome if exec_res.outcome in ("ok", "fail", "unknown") else "fail"
         clean_output = redact_outbound_secrets(exec_res.output, extra_secrets=secrets_to_scrub)
-        clean_did = str(redact_outbound_secrets(exec_res.did or f"{self.adapter.name}:{outcome}", extra_secrets=secrets_to_scrub))[:400]
+        clean_did = str(redact_outbound_secrets(exec_res.did or f"{ad_ref.name}:{outcome}", extra_secrets=secrets_to_scrub))[:400]
         clean_note = str(redact_outbound_secrets(exec_res.pitfall_note or "", extra_secrets=secrets_to_scrub))[:400]
         spend = min(max(0, int(exec_res.spend_micros or 0)), max(0, int(max_cost_micros or 0)))
 
@@ -1759,7 +2020,7 @@ class EdgeHandBridge:
             price_cap = (
                 max(0, int(price_micros))
                 if price_micros is not None
-                else max(0, int(self.spec.price_micros if self.spec.price_micros > 0 else max_cost_micros))
+                else max(0, int(spec_ref.price_micros if spec_ref.price_micros > 0 else max_cost_micros))
             )
             payload["paid_micros"] = min(max(0, int(exec_res.paid_micros)), price_cap) if outcome == "ok" else 0
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -1777,14 +2038,17 @@ class EdgeHandBridge:
         if not run_id:
             return {"ok": False, "error": "missing run_id"}
 
-        if run_id in self._fulfilled_cache:
-            fulfill_body = self._fulfilled_cache[run_id]
+        active_spec, active_adapter = self._resolve_hand_target(event)
+        with self._state_lock:
+            cached_body = self._fulfilled_cache.get(run_id)
+        if cached_body is not None:
+            fulfill_body = cached_body
         else:
             raw_inputs = event.get("input")
             inputs = dict(raw_inputs) if isinstance(raw_inputs, dict) else {}
             max_cost_micros = int(event.get("max_cost_micros") or 0)
             try:
-                exec_res = self.adapter.execute(inputs, event)
+                exec_res = active_adapter.execute(inputs, event)
             except Exception as exc:
                 exec_res = ExecutionResult(
                     outcome="fail",
@@ -1794,17 +2058,20 @@ class EdgeHandBridge:
                 )
             price_cap: int | None = None
             if exec_res.paid_micros is not None:
-                ev_card_id = str(event.get("card_id") or self.spec.card_id or "").strip()
-                price_cap = self._resolve_price_cap(ev_card_id, max_cost_micros)
+                ev_card_id = str(event.get("card_id") or active_spec.card_id or "").strip()
+                price_cap = self._resolve_price_cap(ev_card_id, max_cost_micros, active_spec=active_spec)
             fulfill_body = self._build_safe_fulfill_payload(
                 run_id,
                 exec_res,
                 max_cost_micros,
                 price_micros=price_cap,
+                active_spec=active_spec,
+                active_adapter=active_adapter,
             )
-            self._fulfilled_cache[run_id] = fulfill_body
-            while len(self._fulfilled_cache) > 512:
-                self._fulfilled_cache.popitem(last=False)
+            with self._state_lock:
+                self._fulfilled_cache[run_id] = fulfill_body
+                while len(self._fulfilled_cache) > 512:
+                    self._fulfilled_cache.popitem(last=False)
 
         fst = 0
         fres: dict[str, Any] = {"ok": False}
@@ -1818,22 +2085,42 @@ class EdgeHandBridge:
             time.sleep(0.15 * (attempt + 1))
         return fres
 
-    def poll_and_process_once(self) -> int:
+    def poll_and_process_once(
+        self,
+        *,
+        hand_id: str | None = None,
+        allow_owner_wildcard: bool = False,
+    ) -> int:
+        raw_hid = self.spec.hand_id if hand_id is None else hand_id
+        hid = (raw_hid or "").strip()
+        if not hid and not allow_owner_wildcard:
+            raise BridgeError("hand_id must be non-empty for poll_once/wait_events unless allow_owner_wildcard=True")
         if self._stop_event.is_set():
             return 0
-        self._in_poll_wait = True
+        with self._state_lock:
+            self._active_poll_waiters += 1
+            self._in_poll_wait = True
         try:
-            st, res = self.client.wait_events(self.spec.hand_id, poll_timeout=self.poll_timeout)
+            st, res = self.client.wait_events(
+                hid,
+                poll_timeout=self.poll_timeout,
+                allow_owner_wildcard=allow_owner_wildcard,
+            )
         except _PollInterrupted:
             return 0
         finally:
-            self._in_poll_wait = False
+            with self._state_lock:
+                self._active_poll_waiters = max(0, self._active_poll_waiters - 1)
+                self._in_poll_wait = self._active_poll_waiters > 0
 
         if self._stop_event.is_set():
             return 0
         if st != 200 or not res.get("ok"):
             if not self._stop_event.is_set():
-                _log(f"GET /events/wait transient status={st}: {res.get('error') or res}", stream=self.log_stream)
+                _log(
+                    f"GET /events/wait (hand_id={hid!r}) transient status={st}: {res.get('error') or res}",
+                    stream=self.log_stream,
+                )
                 self._stop_event.wait(timeout=0.5)
             return 0
 
@@ -1846,12 +2133,58 @@ class EdgeHandBridge:
             processed += 1
         return processed
 
+    poll_once = poll_and_process_once
+
     def run_forever(self, *, once: bool = False) -> int:
         with self:
-            while not self._stop_event.is_set():
-                count = self.poll_and_process_once()
-                if once and count > 0:
-                    break
+            if len(self._hands) == 1:
+                only_hid = self._hands[0][0].hand_id
+                while not self._stop_event.is_set():
+                    count = self.poll_and_process_once(hand_id=only_hid)
+                    if once and count > 0:
+                        break
+                return 0
+
+            worker_errors: list[BaseException] = []
+            err_lock = threading.Lock()
+
+            def _poll_worker(target_hid: str) -> None:
+                try:
+                    while not self._stop_event.is_set():
+                        count = self.poll_and_process_once(hand_id=target_hid)
+                        if once and count > 0:
+                            self._stop_event.set()
+                            self.client.interrupt_poll()
+                            break
+                except BaseException as exc:
+                    with err_lock:
+                        worker_errors.append(exc)
+                    self._stop_event.set()
+                    self.client.interrupt_poll()
+
+            threads = [
+                threading.Thread(
+                    target=_poll_worker,
+                    args=(s_item.hand_id,),
+                    name=f"edge-poll-{s_item.hand_id}",
+                    daemon=True,
+                )
+                for s_item, _ in self._hands
+            ]
+            for t in threads:
+                t.start()
+            try:
+                while not self._stop_event.is_set():
+                    if not any(t.is_alive() for t in threads):
+                        break
+                    self._stop_event.wait(timeout=0.2)
+            finally:
+                self._stop_event.set()
+                self.client.interrupt_poll()
+                for t in threads:
+                    t.join(timeout=5.0)
+            if worker_errors:
+                raise worker_errors[0]
         return 0
 
 
@@ -1938,6 +2271,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--owner-label", default="external_edge_hand", help="Owner label for --auto-onboard")
     p.add_argument("--onboarding-url", default="", help="Optional override URL for /bridge/register")
+    p.add_argument("--account-token-file", default=None, help="Optional buyer_key or account_session.json path for auto-binding --auto-onboard seats")
+    p.add_argument(
+        "--no-bind-local-account",
+        dest="bind_local_account",
+        action="store_false",
+        default=True,
+        help="Disable auto-binding --auto-onboard seat keys to local ~/.causal-store-v2/buyer_key or account_session.json",
+    )
+    p.add_argument("--account-token", dest="account_token_discouraged", default=None, help=argparse.SUPPRESS)
     p.add_argument("--api-key", "--token", dest="api_key_discouraged", default=None, help=argparse.SUPPRESS)
 
     # Card & Hand metadata
@@ -1973,9 +2315,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _extract_and_scrub_account_token(argv: list[str]) -> tuple[str, list[str]]:
+    extracted = ""
+    cleaned = list(argv)
+    idx = 0
+    while idx < len(cleaned):
+        arg = cleaned[idx]
+        if arg == "--account-token" and idx + 1 < len(cleaned):
+            extracted = cleaned[idx + 1].strip()
+            cleaned[idx + 1] = "REDACTED"
+            idx += 2
+            continue
+        if arg.startswith("--account-token="):
+            _, _, val = arg.partition("=")
+            extracted = val.strip()
+            cleaned[idx] = "--account-token=REDACTED"
+            idx += 1
+            continue
+        idx += 1
+    return extracted, cleaned
+
+
 def main(argv: list[str] | None = None, *, log_stream: Any = None) -> int:
     target_argv = sys.argv[1:] if argv is None else list(argv)
-    argv_tok, scrubbed_argv = scrub_cli_argv_tokens(target_argv, log_stream=log_stream)
+    argv_acct_tok, pre_scrubbed = _extract_and_scrub_account_token(target_argv)
+    argv_tok, scrubbed_argv = scrub_cli_argv_tokens(pre_scrubbed, log_stream=log_stream)
     if argv is None and scrubbed_argv != target_argv:
         sys.argv[1:] = scrubbed_argv
 
@@ -2000,6 +2364,13 @@ def main(argv: list[str] | None = None, *, log_stream: Any = None) -> int:
             or DEFAULT_STORE_URL
         ).strip().rstrip("/")
 
+        explicit_acct_tok = argv_acct_tok
+        if not explicit_acct_tok and args.account_token_file:
+            afp = Path(args.account_token_file).expanduser()
+            if not afp.is_file():
+                raise BridgeError(f"--account-token-file does not exist: {afp}")
+            explicit_acct_tok = _read_local_account_session_token(afp) or _read_store_key_file(afp)
+
         token, _ = resolve_or_onboard_api_key(
             store_url=store_url,
             key_file=args.key_file,
@@ -2008,21 +2379,40 @@ def main(argv: list[str] | None = None, *, log_stream: Any = None) -> int:
             owner_label=args.owner_label,
             onboarding_url=args.onboarding_url,
             argv_token=argv_tok,
+            account_token=explicit_acct_tok,
+            bind_local_account=bool(args.bind_local_account),
             log_stream=log_stream,
         )
 
-        adapter, default_slug = build_adapter_from_config(args, manifest)
-        spec = CardHandSpec.from_manifest_and_args(manifest, args, default_slug=default_slug)
-
-        bridge = EdgeHandBridge(
-            store_url=store_url,
-            token=token,
-            spec=spec,
-            adapter=adapter,
-            poll_timeout=args.poll_timeout,
-            install_signals=True,
-            log_stream=log_stream,
-        )
+        raw_hands_manifest = manifest.get("hands")
+        if isinstance(raw_hands_manifest, list) and raw_hands_manifest:
+            hand_pairs: list[tuple[CardHandSpec, EdgeAdapter]] = []
+            for entry in raw_hands_manifest:
+                if not isinstance(entry, dict):
+                    raise BridgeError("Each entry in manifest 'hands' must be a JSON object")
+                entry_adapter, entry_slug = build_adapter_from_config(args, entry)
+                entry_spec = CardHandSpec.from_manifest_and_args(entry, None, default_slug=entry_slug)
+                hand_pairs.append((entry_spec, entry_adapter))
+            bridge = EdgeHandBridge(
+                store_url=store_url,
+                token=token,
+                hands=hand_pairs,
+                poll_timeout=args.poll_timeout,
+                install_signals=True,
+                log_stream=log_stream,
+            )
+        else:
+            adapter, default_slug = build_adapter_from_config(args, manifest)
+            spec = CardHandSpec.from_manifest_and_args(manifest, args, default_slug=default_slug)
+            bridge = EdgeHandBridge(
+                store_url=store_url,
+                token=token,
+                spec=spec,
+                adapter=adapter,
+                poll_timeout=args.poll_timeout,
+                install_signals=True,
+                log_stream=log_stream,
+            )
         return bridge.run_forever(once=bool(args.once))
     except BridgeError as err:
         _log(f"ERROR: {err}", stream=log_stream)
