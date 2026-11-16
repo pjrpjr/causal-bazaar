@@ -2117,12 +2117,40 @@ class EdgeHandBridge:
             return 0
         if st != 200 or not res.get("ok"):
             if not self._stop_event.is_set():
-                _log(
-                    f"GET /events/wait (hand_id={hid!r}) transient status={st}: {res.get('error') or res}",
-                    stream=self.log_stream,
-                )
+                err_detail = res.get("error") or res
+                err_sig = f"{st}:{err_detail}"
+                with self._state_lock:
+                    streaks = getattr(self, "_poll_transient_streaks", None)
+                    if streaks is None:
+                        streaks = {}
+                        self._poll_transient_streaks = streaks
+                    prev_sig, prev_cnt = streaks.get(hid, ("", 0))
+                    cur_cnt = (prev_cnt + 1) if prev_sig == err_sig else 1
+                    streaks[hid] = (err_sig, cur_cnt)
+                if cur_cnt == 1:
+                    _log(
+                        f"GET /events/wait (hand_id={hid!r}) transient status={st}: {err_detail}",
+                        stream=self.log_stream,
+                    )
+                elif cur_cnt % 30 == 0:
+                    _log(
+                        f"GET /events/wait (hand_id={hid!r}) transient status={st} repeated {cur_cnt}x "
+                        f"(suppressed {cur_cnt - 1} duplicates): {err_detail}",
+                        stream=self.log_stream,
+                    )
                 self._stop_event.wait(timeout=0.5)
             return 0
+
+        recovered_cnt = 0
+        with self._state_lock:
+            streaks = getattr(self, "_poll_transient_streaks", None)
+            if streaks and hid in streaks:
+                _, recovered_cnt = streaks.pop(hid)
+        if recovered_cnt > 1 and not self._stop_event.is_set():
+            _log(
+                f"GET /events/wait (hand_id={hid!r}) recovered after {recovered_cnt} transient poll errors",
+                stream=self.log_stream,
+            )
 
         events = res.get("events") or []
         processed = 0

@@ -206,7 +206,7 @@ def _keyring_dir(args: argparse.Namespace) -> Path:
 def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False) -> tuple[str, list[str]]:
     kr_dir = _keyring_dir(args)
     buyer_file = kr_dir / "buyer_key"
-    explicit_kr = bool(getattr(args, "keyring_dir", None))
+    explicit_kr = bool(getattr(args, "keyring_dir", None) or os.environ.get("BAZAAR_KEYRING_DIR", "").strip())
     env_seller_file = (
         ""
         if explicit_kr
@@ -248,6 +248,16 @@ def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False
     buyer_tok = _read_key_file(buyer_file)
     seat_tok = _read_key_file(seat_file) or _read_key_file(kr_dir / "edge_seat_key")
 
+    if explicit_kr and (buyer_tok or seat_tok):
+        ordered = (
+            (seat_tok, buyer_tok, seller_env_tok, env_tok)
+            if prefer_seller_seat
+            else (buyer_tok, seat_tok, env_tok, seller_env_tok)
+        )
+        for cand in ordered:
+            if cand:
+                return cand, all_known
+
     if prefer_seller_seat:
         for cand in (seller_env_tok, seat_tok, env_tok, buyer_tok):
             if cand:
@@ -265,6 +275,19 @@ def _resolve_token(args: argparse.Namespace, *, prefer_seller_seat: bool = False
         if cand:
             return cand, all_known
     return "", all_known
+
+
+def _keyring_disk_fallback_token(args: argparse.Namespace, used_tok: str, *, prefer_seller_seat: bool = False) -> str:
+    if getattr(args, "key_file", None):
+        return ""
+    kr_dir = _keyring_dir(args)
+    buyer_tok = _read_key_file(kr_dir / "buyer_key")
+    seat_tok = _read_key_file(kr_dir / "edge_seat_key")
+    cands = (seat_tok, buyer_tok) if prefer_seller_seat else (buyer_tok, seat_tok)
+    for cand in cands:
+        if cand and cand != used_tok:
+            return cand
+    return ""
 
 
 def _open_url_with_proxy_fallback(
@@ -606,6 +629,11 @@ def _cmd_wallet(args: argparse.Namespace) -> int:
         )
 
     me_code, me_data = _http_json("GET", f"{north}/api/account/me", token=tok, timeout=15.0)
+    if me_code in (401, 403) or (isinstance(me_data, dict) and me_data.get("authenticated") is False):
+        fb_tok = _keyring_disk_fallback_token(args, tok)
+        if fb_tok:
+            tok = fb_tok
+            me_code, me_data = _http_json("GET", f"{north}/api/account/me", token=tok, timeout=15.0)
     if me_code == 200 and isinstance(me_data, dict) and me_data.get("authenticated") is True:
         for k_field in ("primary_buyer_key", "primary_seller_key"):
             k_obj = me_data.get(k_field)
@@ -623,8 +651,18 @@ def _cmd_wallet(args: argparse.Namespace) -> int:
         return _emit(me_data, secrets_to_scrub=scrub, exit_code=0)
 
     m_code, is_err, w_data = _call_mcp_tool(north, "bazaar_whoami", {}, token=tok)
+    if is_err and isinstance(w_data, dict) and w_data.get("code") == "unauthorized":
+        fb_tok = _keyring_disk_fallback_token(args, tok)
+        if fb_tok:
+            tok = fb_tok
+            m_code, is_err, w_data = _call_mcp_tool(north, "bazaar_whoami", {}, token=tok)
     if m_code == 404:
         r_code, r_data = _http_json("GET", f"{south}/whoami", token=tok)
+        if r_code == 401:
+            fb_tok = _keyring_disk_fallback_token(args, tok)
+            if fb_tok:
+                tok = fb_tok
+                r_code, r_data = _http_json("GET", f"{south}/whoami", token=tok)
         w_data = r_data if isinstance(r_data, dict) else {"ok": False}
         is_err = r_code != 200 or not w_data.get("ok")
     if is_err:
@@ -656,8 +694,18 @@ def _cmd_whoami(args: argparse.Namespace) -> int:
     if not tok:
         return _emit({"ok": False, "error": "No API key configured in env or keyring"}, secrets_to_scrub=scrub, exit_code=1)
     code, is_err, data = _call_mcp_tool(north, "bazaar_whoami", {}, token=tok)
+    if is_err and isinstance(data, dict) and data.get("code") == "unauthorized":
+        fb_tok = _keyring_disk_fallback_token(args, tok)
+        if fb_tok:
+            tok = fb_tok
+            code, is_err, data = _call_mcp_tool(north, "bazaar_whoami", {}, token=tok)
     if code == 404:
         r_code, r_data = _http_json("GET", f"{south}/whoami", token=tok)
+        if r_code == 401:
+            fb_tok = _keyring_disk_fallback_token(args, tok)
+            if fb_tok:
+                tok = fb_tok
+                r_code, r_data = _http_json("GET", f"{south}/whoami", token=tok)
         return _emit(r_data, secrets_to_scrub=scrub, exit_code=(0 if r_code == 200 and r_data.get("ok") else 1))
     return _emit(data, secrets_to_scrub=scrub, exit_code=(1 if is_err else 0))
 
@@ -813,6 +861,11 @@ def _cmd_find(args: argparse.Namespace) -> int:
             tool_args["gate"] = args.gate
 
         code, is_err, mcp_data = _call_mcp_tool(north, "bazaar_find", tool_args, token=tok)
+        if is_err and isinstance(mcp_data, dict) and mcp_data.get("code") == "unauthorized":
+            fb_tok = _keyring_disk_fallback_token(args, tok)
+            if fb_tok:
+                tok = fb_tok
+                code, is_err, mcp_data = _call_mcp_tool(north, "bazaar_find", tool_args, token=tok)
         if code == 404:
             qs: dict[str, str] = {"format": "json"}
             if q:
@@ -820,6 +873,11 @@ def _cmd_find(args: argparse.Namespace) -> int:
             if args.gate:
                 qs["gate"] = args.gate
             r_code, r_data = _http_json("GET", f"{south}/find?{urllib.parse.urlencode(qs)}", token=tok)
+            if r_code == 401:
+                fb_tok = _keyring_disk_fallback_token(args, tok)
+                if fb_tok:
+                    tok = fb_tok
+                    r_code, r_data = _http_json("GET", f"{south}/find?{urllib.parse.urlencode(qs)}", token=tok)
             if r_code != 200 or not isinstance(r_data, dict):
                 return _emit(r_data if isinstance(r_data, dict) else {"ok": False}, secrets_to_scrub=scrub, exit_code=1)
             raw_cards = r_data.get("cards") if isinstance(r_data.get("cards"), list) else []
@@ -960,6 +1018,17 @@ def _cmd_use(args: argparse.Namespace) -> int:
         token=tok,
         timeout=http_wait_sec,
     )
+    if is_err and isinstance(data, dict) and data.get("code") == "unauthorized" and not data.get("run_id"):
+        fb_tok = _keyring_disk_fallback_token(args, tok)
+        if fb_tok:
+            tok = fb_tok
+            code, is_err, data = _call_mcp_tool(
+                north,
+                "bazaar_use",
+                tool_args,
+                token=tok,
+                timeout=http_wait_sec,
+            )
     if code == 404 or (
         bridged_catalog_id is not None
         and is_err
@@ -981,6 +1050,18 @@ def _cmd_use(args: argparse.Namespace) -> int:
             extra_headers={"Idempotency-Key": idem_key},
             timeout=http_wait_sec,
         )
+        if r_code == 401 and isinstance(r_data, dict) and not r_data.get("run_id"):
+            fb_tok = _keyring_disk_fallback_token(args, tok)
+            if fb_tok:
+                tok = fb_tok
+                r_code, r_data = _http_json(
+                    "POST",
+                    f"{south}/use/{urllib.parse.quote(target_card_id, safe='')}",
+                    token=tok,
+                    body=use_body,
+                    extra_headers={"Idempotency-Key": idem_key},
+                    timeout=http_wait_sec,
+                )
         data = r_data if isinstance(r_data, dict) else {"ok": False, "data": r_data}
         is_err = r_code != 200 or not data.get("ok")
 
