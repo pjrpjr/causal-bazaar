@@ -611,6 +611,24 @@ def _cmd_login(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def _enrich_wallet_availability(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    bal = out.get("balance_micros")
+    held = out.get("inflight_reserved_micros", 0)
+    if isinstance(bal, int) and not isinstance(bal, bool):
+        held_i = int(held) if isinstance(held, int) and not isinstance(held, bool) else 0
+        if "available_minus_held_micros" not in out:
+            out["available_minus_held_micros"] = max(0, bal - max(0, held_i))
+    d_lim = out.get("daily_limit_micros")
+    d_spent = out.get("spent_today_micros", 0)
+    if isinstance(d_lim, int) and not isinstance(d_lim, bool) and d_lim > 0:
+        d_sp_i = int(d_spent) if isinstance(d_spent, int) and not isinstance(d_spent, bool) else 0
+        held_i = int(held) if isinstance(held, int) and not isinstance(held, bool) else 0
+        if "daily_available_micros" not in out:
+            out["daily_available_micros"] = max(0, d_lim - max(0, d_sp_i) - max(0, held_i))
+    return out
+
+
 def _cmd_wallet(args: argparse.Namespace) -> int:
     north, south = _store_urls(args)
     tok, scrub = _resolve_token(args)
@@ -667,6 +685,7 @@ def _cmd_wallet(args: argparse.Namespace) -> int:
         is_err = r_code != 200 or not w_data.get("ok")
     if is_err:
         return _emit(w_data, secrets_to_scrub=scrub, exit_code=1)
+    w_data = _enrich_wallet_availability(w_data)
     return _emit(
         {
             "ok": True,
@@ -675,6 +694,8 @@ def _cmd_wallet(args: argparse.Namespace) -> int:
             "wallet": {
                 "balance_micros": w_data.get("balance_micros", 0),
                 "inflight_reserved_micros": w_data.get("inflight_reserved_micros", 0),
+                "available_minus_held_micros": w_data.get("available_minus_held_micros", 0),
+                "daily_available_micros": w_data.get("daily_available_micros"),
                 "spent_today_micros": w_data.get("spent_today_micros", 0),
                 "daily_limit_micros": w_data.get("daily_limit_micros", 0),
                 "per_call_limit_micros": w_data.get("per_call_limit_micros", 0),
@@ -706,7 +727,11 @@ def _cmd_whoami(args: argparse.Namespace) -> int:
             if fb_tok:
                 tok = fb_tok
                 r_code, r_data = _http_json("GET", f"{south}/whoami", token=tok)
+        if isinstance(r_data, dict):
+            r_data = _enrich_wallet_availability(r_data)
         return _emit(r_data, secrets_to_scrub=scrub, exit_code=(0 if r_code == 200 and r_data.get("ok") else 1))
+    if isinstance(data, dict) and not is_err:
+        data = _enrich_wallet_availability(data)
     return _emit(data, secrets_to_scrub=scrub, exit_code=(1 if is_err else 0))
 
 
@@ -1639,6 +1664,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--southbound-store-url", default=argparse.SUPPRESS, help="Southbound Store API URL override")
     common.add_argument("--keyring-dir", default=argparse.SUPPRESS, help="0600 keyring directory (~/.causal-store-v2)")
     common.add_argument("--key-file", default=argparse.SUPPRESS, help="Explicit 0600 key file override")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="Emit structured JSON output (default)")
 
     root = argparse.ArgumentParser(
         prog="bazaar",
