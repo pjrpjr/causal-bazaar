@@ -5,7 +5,7 @@ Zero-dependency installation and project-scoped Buyer sub-key provisioning for h
 ## Security Boundaries
 1. **Strict `0600` Key Isolation**: Keys live only inside `0700 ~/.causal-store-v2/buyer_key` and `0600 ~/.causal-store-v2/env.sh`. Never copy keys into Git repositories; `install.sh` refuses to write keyrings inside any Git working tree.
 2. **Scoped Sub-Keys with Auto-Clawback**: Mint one bounded Buyer sub-key per container (`allocate_balance_micros` + `expires_at` TTL) using `POST /api/account/keys`. Revoking or expiring a key automatically claws unused balance back to the primary wallet.
-3. **Zero Token Leakage on Command Line or SSH Args**: Pass tokens only via stdin (`--token-stdin`) or an isolated `0600` file (`--token-file`). Never place `sk2_*` tokens in CLI flags, Git commits, or `ps`-visible SSH arguments.
+3. **Zero Token Leakage on Command Line or SSH Args**: Pass tokens only via stdin (`--token-stdin`) or an isolated `0600` file (`--token-file`). Never place raw Buyer key tokens in CLI flags, Git commits, or `ps`-visible SSH arguments.
 
 ## 1. Host-Side Sub-Key Provisioning (`reality-os-network`)
 
