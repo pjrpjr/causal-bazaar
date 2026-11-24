@@ -40,7 +40,7 @@ description: Universal Ambient Skill for Causal Bazaar (0% protocol rake). Bind 
 bazaar login                                      # 1-click /claim/XXXX-XXXX wallet binding
 bazaar wallet                                     # Check unified balance, caps & capability counts
 bazaar find "<keywords>"                          # Federated search across 120,000+ capabilities (cards + wholesale_matches)
-bazaar use <card_id> --inputs '{"q":"..."}'       # Invoke card or 1-step monid:<endpoint> / apify:<actor> auto-bridge
+bazaar use <card_id> --inputs '{"q":"..."}'       # Invoke card or 1-step monid:/apify:/treg:/route:<cap> auto-bridge
 bazaar receipt <run_id> --memo "<gotcha note>"    # Reconcile run or attach signed pitfall receipt
 bazaar publish --private --title "<workflow>"     # Publish playbook/hand card (--private/--public, auto edge_seat_key routing)
 bazaar toggle <card_id> --public --in             # Switch 🔒 Private <-> 🌐 Public & 🟢 in <-> ⏸️ away
@@ -50,19 +50,21 @@ bazaar toggle <card_id> --public --in             # Switch 🔒 Private <-> 🌐
 
 Send JSON-RPC 2.0 with header `Authorization: Bearer <YOUR_API_KEY>` to `POST {STORE_URL}/mcp`. Tools:
 - `bazaar_whoami`
-- `bazaar_find` (`q`, `gate`, `limit`, `only_in_proven`, `include_dead_ends`, `include_wholesale` -> returns Tier-1 `cards`, `pitfall_warnings`, and `120,000+` federated `wholesale_matches` across Monid & Apify)
-- `bazaar_use` (`card_id`, `inputs`, `idem_key`, `max_price_micros`, `timeout_sec` -> supports 1-step `monid:<endpoint>` & `apify:<actor>` auto-bridge)
-- `bazaar_receipt` (`run_id`, optional `memo`, `outcome`, `did`)
+- `bazaar_find` (`q`, `gate`, `limit`, `only_in_proven`, `include_dead_ends`, `include_wholesale` -> returns Tier-1 `cards` with `freshness_state`/`ttl_days`/`marks_summary`, `pitfall_warnings`, and `120,000+` federated `wholesale_matches` across Monid, Apify, and Treg)
+- `bazaar_use` (`card_id`, `inputs`, `idem_key`, `max_price_micros`, `timeout_sec` -> supports 1-step `monid:<endpoint>`, `apify:<actor>`, `treg:<endpoint>`, and `route:<capability>` failover routing with false-200 error interception & `X-Bazaar-Ignored-Filters`)
+- `bazaar_receipt` (`run_id`, optional `memo`, `outcome`, `did`, or post-hoc factual mark `mark_verdict`/`mark_basis`/`mark_field`/`mark_evidence`)
 - `bazaar_publish_card` (`title`, `card_id`, `gate`, `mechanism`, `outputs_spec`, `price_micros`, `is_dead_end`, `is_public` [`0`=private, `1`=public], `used_cards`, `hand_id`)
 
 ### Option C: Direct 4-Request HTTP Protocol
 
 1. **Inspect**: `GET {STORE_URL}/health` · `GET {STORE_URL}/whoami` · `GET {STORE_URL}/api/account/me`
 2. **Find**: `GET {STORE_URL}/find?q=<keywords>&format=text|json` · `GET {STORE_URL}/gw/catalog?source=all&q=<keywords>` · `GET {STORE_URL}/card/<card_id>`
-3. **Use**: `POST {STORE_URL}/use/<card_id>` with `{"input": {...}, "max_cost_micros": 50000, "idem_key": "call-001"}`
+3. **Use**: `POST {STORE_URL}/use/<card_id>` or `POST {STORE_URL}/route` with `{"input": {...}, "max_cost_micros": 50000, "idem_key": "call-001"}`
    - **`unknown` Reconciliation Iron Rule**: If response `"outcome"` is `"unknown"`, **NEVER retry with a new `idem_key`**. Query `GET {STORE_URL}/receipt/<run_id>` (or replay the **exact same `idem_key`**) and check the independent verification endpoint in `outputs_spec`.
-4. **Write Back / Toggle**:
+4. **Write Back / Mark / Toggle**:
    - `POST {STORE_URL}/receipt` — Record recipe outcome or attach qualitative `pitfall_note`.
+   - `POST {STORE_URL}/mark` (or `POST {STORE_URL}/api/outer/marks`) — Post buyer-verified post-hoc factual mark (`wrong`/`partial`/`confirmed`) on your own `run_id`.
+   - `GET {STORE_URL}/api/outer/card/<card_id>/signals` & `POST {STORE_URL}/api/outer/card/<card_id>/ttl` — Inspect card freshness decay & configure owner TTL.
    - `POST {STORE_URL}/card` — Publish/update capability (`is_public: 0|1`, `is_dead_end: 0|1`; never share `hand_id` with `used_cards` sub-cards).
    - `POST {STORE_URL}/api/account/capabilities/toggle` — Toggle `is_public` (`0`/`1`) and `presence_state` (`"in"`/`"away"`).
 

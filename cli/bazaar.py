@@ -712,17 +712,24 @@ def _cmd_whoami(args: argparse.Namespace) -> int:
 
 def _compact_wholesale_item(it: dict[str, Any]) -> dict[str, Any]:
     raw_cat_id = str(it.get("catalog_id") or "")
-    src = str(it.get("source") or ("apify" if raw_cat_id.startswith("apify:") else "monid"))
+    src = str(
+        it.get("source")
+        or ("apify" if raw_cat_id.startswith("apify:") else ("treg" if raw_cat_id.startswith("treg:") else "monid"))
+    )
     ep_id = str(it.get("endpoint_id") or (raw_cat_id.split(":", 1)[1] if ":" in raw_cat_id else ""))
     cat_id = raw_cat_id or (f"{src}:{ep_id}" if ep_id else "")
     bridge_cid = str(
         it.get("bridge_card_id")
-        or ("apify_actor_universal_bridge" if src == "apify" else "monid_wholesale_tool_bridge")
+        or (
+            "apify_actor_universal_bridge"
+            if src == "apify"
+            else ("treg_wholesale_tool_bridge" if src == "treg" else "monid_wholesale_tool_bridge")
+        )
     )
     default_inputs = (
-        {"action": "run", "endpoint": ep_id, "input": {}}
-        if src == "monid"
-        else {"action": "run", "actor_id": ep_id, "input": {}}
+        {"action": "run", "actor_id": ep_id, "input": {}}
+        if src == "apify"
+        else {"action": "run", "endpoint": ep_id, "input": {}}
     )
     ex = it.get("run_payload_example")
     return {
@@ -788,6 +795,27 @@ def _resolve_wholesale_bridge(
             else:
                 wrapped = {"action": "run", "actor_id": actor_id, "input": raw_inputs, "max_upstream_usd": max_usd}
         return cid, wrapped, f"apify:{actor_id}"
+
+    if s.startswith("treg:"):
+        ep = s[5:].strip()
+        if not ep or len(ep) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in ep) or ".." in ep:
+            raise ValueError("invalid treg endpoint")
+        cid = "treg_wholesale_tool_bridge"
+        if raw_inputs.get("action") and raw_inputs.get("endpoint"):
+            wrapped = dict(raw_inputs)
+        elif raw_inputs.get("action") in ("search", "check_call"):
+            wrapped = {**raw_inputs, "endpoint": ep}
+        else:
+            max_usd = float(raw_inputs.get("max_upstream_usd", 0.05))
+            if (
+                raw_inputs.get("action") == "run"
+                and isinstance(raw_inputs.get("input"), dict)
+                and set(raw_inputs.keys()) <= {"action", "input", "max_upstream_usd", "strict_filters", "no_cache", "method", "query"}
+            ):
+                wrapped = {**raw_inputs, "endpoint": ep, "max_upstream_usd": max_usd}
+            else:
+                wrapped = {"action": "run", "endpoint": ep, "input": raw_inputs, "max_upstream_usd": max_usd}
+        return cid, wrapped, f"treg:{ep}"
 
     return None, raw_inputs, None
 
@@ -994,7 +1022,7 @@ def _cmd_use(args: argparse.Namespace) -> int:
     eff_timeout_sec: float | None = (
         float(args.timeout_sec)
         if args.timeout_sec is not None
-        else (45.0 if bridged_catalog_id is not None else None)
+        else (45.0 if (bridged_catalog_id is not None or str(target_card_id).startswith("route:")) else None)
     )
     http_wait_sec = max(30.0, float(eff_timeout_sec or 25.0) + 10.0)
 
